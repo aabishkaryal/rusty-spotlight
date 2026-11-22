@@ -2,9 +2,9 @@
 
 # Rusty Spotlight
 
-<p align="center"><a href="assets/demo.mp4"><img src="assets/demo-poster.png" width="720" alt="Rusty Spotlight's glass panel with a list of apps, coloured shapes bending through the glass behind it"></a></p>
+<p align="center"><a href="https://blackkspydo.github.io/rusty-spotlight/"><img src="assets/demo-poster.png" width="720" alt="Rusty Spotlight's glass panel with a list of apps, coloured shapes bending through the glass behind it"></a></p>
 
-<p align="center"><b><a href="assets/demo.mp4">▶ Watch the demo (34 s)</a></b><br><sub>Opening spring, the glass taking each app's colours (Spotify, Chrome, Safari, Maps, Photos), the list springing open, a sum, currency, the time in Tokyo, units and Command-K. Recorded live with <code>scripts/record-demo.swift</code>, glass colour at Strong.</sub></p>
+<p align="center"><b><a href="https://blackkspydo.github.io/rusty-spotlight/">▶ Watch the demo (34 s) on the website</a></b><br><sub>Opening spring, the glass taking each app's colours (Spotify, Chrome, Safari, Maps, Photos), the list springing open, a sum, currency, the time in Tokyo, units and Command-K. Recorded live with <code>scripts/record-demo.swift</code>, glass colour at Strong.</sub></p>
 
 A fast Spotlight replacement for macOS, written in Rust. It looks and moves like Spotlight, on the same Liquid Glass, but only searches what you ask it to:
 
@@ -124,6 +124,7 @@ target/release/rusty-spotlight --rank saf   # show how a query ranks
 target/release/rusty-spotlight --apps       # list the apps it found
 swift scripts/make-icon.swift               # redraw assets/AppIcon.icns
 swift scripts/record-demo.swift             # re-record assets/demo.mp4 (takes over the screen ~35 s)
+./scripts/publish-site.sh                   # publish site/ and the demo to GitHub Pages
 ```
 
 Quit an installed copy first, so the shortcut isn't taken twice. Run `./scripts/install.sh` again to put the installed copy back.
