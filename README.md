@@ -116,6 +116,7 @@ cargo test                       # core logic and the macOS shell's own tests
 cargo run --release              # run from the build folder (no login item)
 target/release/rusty-spotlight --rank saf   # show how a query ranks
 target/release/rusty-spotlight --apps       # list the apps it found
+swift scripts/make-icon.swift               # redraw assets/AppIcon.icns
 ```
 
 Quit an installed copy first, so the shortcut isn't taken twice. Run `./scripts/install.sh` again to put the installed copy back.

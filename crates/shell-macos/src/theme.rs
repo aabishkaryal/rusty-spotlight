@@ -129,10 +129,86 @@ fn pair(c: Rgb) -> (Rgb, Rgb) {
     (from_hsv(h, s, v), from_hsv(h + 38.0, s, v))
 }
 
-/// The vivid colour of an app icon: drawn at 16×16, each pixel weighted by
-/// opacity and saturation so a white or grey frame does not wash it out.
-fn icon_colour(image: &NSImage) -> Option<Rgb> {
-    const N: isize = 16;
+/// The same hue, saturated and bright enough to read through glass.
+fn vivid(c: Rgb) -> Rgb {
+    let (h, s, v) = to_hsv(c);
+    from_hsv(h, s.clamp(0.45, 0.9), v.clamp(0.75, 1.0))
+}
+
+/// The colours an app icon gives the glass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Palette {
+    /// The icon's strongest colour.
+    pub first: Rgb,
+    /// A second, clearly different colour of the icon (Chrome's yellow beside
+    /// its red), for the gradient's far end. Without one the far end is a
+    /// neighbouring hue of `first`.
+    pub second: Option<Rgb>,
+}
+
+const BINS: usize = 24; // 15° of hue each
+
+/// Find an icon's palette from its pixels (straight colour, opacity).
+///
+/// Pixels are sorted into hue buckets, weighted by opacity, brightness and
+/// saturation (squared, so vivid pixels outweigh a pale frame). The heaviest
+/// bucket, smoothed with its neighbours, is the first colour; the heaviest
+/// bucket at least 45° away, if it holds a quarter as much, is the second.
+/// An icon with almost no vivid colour is searched again for faint hues.
+/// `None` means the icon is grey.
+pub fn palette(pixels: &[(Rgb, f64)]) -> Option<Palette> {
+    let opaque = pixels.iter().filter(|(_, a)| *a >= 0.5).count() as f64;
+    if opaque == 0.0 {
+        return None;
+    }
+    // (min saturation, saturation power, share of opaque pixels needed)
+    for (min_s, power, needed) in [(0.12, 2, 0.02), (0.05, 1, 0.012)] {
+        let mut weight = [0.0f64; BINS];
+        let mut sum = [(0.0f64, 0.0f64, 0.0f64); BINS];
+        for &(c, a) in pixels {
+            if a < 0.5 {
+                continue;
+            }
+            let (h, s, v) = to_hsv(c);
+            if s < min_s || v < 0.15 {
+                continue;
+            }
+            let w = a * s.powi(power) * v;
+            let b = ((h / 360.0 * BINS as f64) as usize).min(BINS - 1);
+            weight[b] += w;
+            sum[b] = (sum[b].0 + c.0 * w, sum[b].1 + c.1 * w, sum[b].2 + c.2 * w);
+        }
+        if weight.iter().sum::<f64>() < needed * opaque {
+            continue;
+        }
+        let around = |b: usize| [(b + BINS - 1) % BINS, b, (b + 1) % BINS];
+        let smooth = |b: usize| weight[b] + 0.5 * (weight[(b + BINS - 1) % BINS] + weight[(b + 1) % BINS]);
+        let mean = |b: usize| {
+            let (mut c, mut w) = ((0.0, 0.0, 0.0), 0.0);
+            for i in around(b) {
+                c = (c.0 + sum[i].0, c.1 + sum[i].1, c.2 + sum[i].2);
+                w += weight[i];
+            }
+            (c.0 / w, c.1 / w, c.2 / w)
+        };
+        let top = (0..BINS).max_by(|&a, &b| smooth(a).total_cmp(&smooth(b)))?;
+        let apart = |b: usize| {
+            let d = b.abs_diff(top);
+            d.min(BINS - d) >= 3
+        };
+        let second = (0..BINS)
+            .filter(|&b| apart(b) && weight[b] > 0.0)
+            .max_by(|&a, &b| smooth(a).total_cmp(&smooth(b)))
+            .filter(|&b| smooth(b) >= 0.25 * smooth(top))
+            .map(mean);
+        return Some(Palette { first: mean(top), second });
+    }
+    None
+}
+
+/// An app icon's pixels, drawn at 32×32: (straight colour, opacity).
+fn icon_pixels(image: &NSImage) -> Option<Vec<(Rgb, f64)>> {
+    const N: isize = 32;
     unsafe {
         let rep = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
             NSBitmapImageRep::alloc(),
@@ -162,30 +238,18 @@ fn icon_colour(image: &NSImage) -> Option<Rgb> {
         if data.is_null() {
             return None;
         }
-        let pixels = std::slice::from_raw_parts(data, (N * N * 4) as usize);
-        let (mut sum, mut weight) = ((0.0, 0.0, 0.0), 0.0);
-        let mut plain = ((0.0, 0.0, 0.0), 0.0);
-        for p in pixels.chunks_exact(4) {
-            let a = f64::from(p[3]) / 255.0;
-            if a < 0.5 {
-                continue;
-            }
-            // Premultiplied: undo it.
-            let c = (f64::from(p[0]) / 255.0 / a, f64::from(p[1]) / 255.0 / a, f64::from(p[2]) / 255.0 / a);
-            let (_, s, v) = to_hsv(c);
-            let w = a * s * s * v;
-            sum = (sum.0 + c.0 * w, sum.1 + c.1 * w, sum.2 + c.2 * w);
-            weight += w;
-            plain = ((plain.0.0 + c.0, plain.0.1 + c.1, plain.0.2 + c.2), plain.1 + 1.0);
-        }
-        if weight > 0.5 {
-            Some((sum.0 / weight, sum.1 / weight, sum.2 / weight))
-        } else if plain.1 > 0.0 {
-            // A grey icon (Terminal, Settings): a quiet blue-grey, not nothing.
-            Some((0.55, 0.62, 0.75))
-        } else {
-            None
-        }
+        let bytes = std::slice::from_raw_parts(data, (N * N * 4) as usize);
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|p| {
+                    let a = f64::from(p[3]) / 255.0;
+                    // Premultiplied: undo it.
+                    let k = if a > 0.0 { 255.0 * a } else { 1.0 };
+                    ((f64::from(p[0]) / k, f64::from(p[1]) / k, f64::from(p[2]) / k), a)
+                })
+                .collect(),
+        )
     }
 }
 
@@ -208,7 +272,7 @@ pub struct Tint {
     /// `theme_strength`, 0 to 1.
     level: Cell<f64>,
     shown: RefCell<Option<Stops>>,
-    icons: RefCell<HashMap<String, Option<Rgb>>>,
+    icons: RefCell<HashMap<String, Option<Palette>>>,
 }
 
 fn cg_colours(stops: &Stops) -> Retained<NSMutableArray<AnyObject>> {
@@ -288,8 +352,11 @@ impl Tint {
         self.level.get() * if dark(&self.view) { 0.34 } else { 0.24 }
     }
 
-    fn stops_for(&self, main: Rgb, soft: f64) -> Stops {
-        let (a, b) = pair(main);
+    fn stops_for(&self, palette: Palette, soft: f64) -> Stops {
+        let (a, b) = match palette.second {
+            Some(second) => (vivid(palette.first), vivid(second)),
+            None => pair(palette.first),
+        };
         let k = self.strength() * soft;
         [(a, k), (b, k * 0.55), (b, k * 0.18)]
     }
@@ -297,23 +364,26 @@ impl Tint {
     /// Show the colours for `subject` now, cross-fading from what is shown.
     pub fn update(&self, subject: &Subject) {
         let theme = self.theme.borrow().clone();
+        let one = |c: Rgb| Palette { first: c, second: None };
         let main = match theme {
             Theme::None => None,
-            Theme::Accent => Some(accent()),
-            Theme::Fixed(c) => Some(c),
+            Theme::Accent => Some(one(accent())),
+            Theme::Fixed(c) => Some(one(c)),
             Theme::Aurora => return self.drift(),
             Theme::Selection => match subject {
                 Subject::App(image, path) => {
                     let known = self.icons.borrow().get(*path).copied();
-                    known.unwrap_or_else(|| {
-                        let c = icon_colour(image);
-                        self.icons.borrow_mut().insert(path.to_string(), c);
-                        c
-                    })
+                    let palette = known.unwrap_or_else(|| {
+                        let p = icon_pixels(image).and_then(|px| palette(&px));
+                        self.icons.borrow_mut().insert(path.to_string(), p);
+                        p
+                    });
+                    // A grey icon (Terminal, Script Editor) takes the accent colour.
+                    Some(palette.unwrap_or_else(|| one(accent())))
                 }
                 // The empty field keeps a faint accent colour (see `soft`).
-                Subject::Nothing => Some(accent()),
-                other => kind_colour(other),
+                Subject::Nothing => Some(one(accent())),
+                other => kind_colour(other).map(one),
             },
         };
         // Nothing selected: the colour stands for nothing, so it is fainter.
@@ -397,5 +467,129 @@ impl Tint {
             let _: () = msg_send![&*self.layer, removeAllAnimations];
         }
         *self.shown.borrow_mut() = None;
+    }
+}
+
+// ---------------------------------------------------------------- diagnostic
+
+fn png_base64(image: &NSImage, size: isize) -> String {
+    use objc2_app_kit::NSBitmapImageFileType;
+    let data = unsafe {
+        let Some(rep) = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(), std::ptr::null_mut(), size, size, 8, 4, true, false,
+            objc2_app_kit::NSDeviceRGBColorSpace, 0, 0,
+        ) else { return String::new() };
+        let Some(context) = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep) else { return String::new() };
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&context));
+        image.drawInRect_fromRect_operation_fraction(
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size as f64, size as f64)),
+            NSRect::ZERO,
+            NSCompositingOperation::SourceOver,
+            1.0,
+        );
+        context.flushGraphics();
+        NSGraphicsContext::restoreGraphicsState_class();
+        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &objc2_foundation::NSDictionary::new())
+    };
+    let bytes = data.map(|d| d.to_vec()).unwrap_or_default();
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// The single averaged colour used before palettes, for comparison.
+fn legacy(pixels: &[(Rgb, f64)]) -> Rgb {
+    let (mut sum, mut weight) = ((0.0, 0.0, 0.0), 0.0);
+    for &(c, a) in pixels {
+        if a < 0.5 {
+            continue;
+        }
+        let (_, s, v) = to_hsv(c);
+        let w = a * s * s * v;
+        sum = (sum.0 + c.0 * w, sum.1 + c.1 * w, sum.2 + c.2 * w);
+        weight += w;
+    }
+    // At 32×32 the old 16×16 threshold of 0.5 is 2.0.
+    if weight > 2.0 { (sum.0 / weight, sum.1 / weight, sum.2 / weight) } else { (0.55, 0.62, 0.75) }
+}
+
+fn css(stops: &[(Rgb, f64); 3]) -> String {
+    let c = |((r, g, b), a): (Rgb, f64)| format!("rgba({:.0},{:.0},{:.0},{a:.2})", r * 255.0, g * 255.0, b * 255.0);
+    format!("linear-gradient(135deg, {} 0%, {} 55%, {} 100%)", c(stops[0]), c(stops[1]), c(stops[2]))
+}
+
+/// `rusty-spotlight --icon-colours OUT.html`: every app's icon with the glass
+/// colour it gets now and got before, at full strength, for checking by eye.
+pub fn diagnose(apps: &[(String, String)], out: &str) {
+    let k = 0.34;
+    let mut rows = String::new();
+    let (mut grey, mut two) = (0, 0);
+    for (title, path) in apps {
+        let icon = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(path));
+        let Some(pixels) = icon_pixels(&icon) else { continue };
+        let old = pair(legacy(&pixels));
+        let before = [(old.0, k), (old.1, k * 0.55), (old.1, k * 0.18)];
+        let found = palette(&pixels);
+        let p = found.unwrap_or(Palette { first: accent(), second: None });
+        let (a, b) = match p.second { Some(s) => (vivid(p.first), vivid(s)), None => pair(p.first) };
+        let after = [(a, k), (b, k * 0.55), (b, k * 0.18)];
+        let note = match found {
+            None => { grey += 1; "grey: accent colour" }
+            Some(Palette { second: Some(_), .. }) => { two += 1; "two colours" }
+            Some(_) => "one colour",
+        };
+        rows.push_str(&format!(
+            "<tr><td><img src=\"data:image/png;base64,{}\"></td><td>{}</td><td><div class=g style=\"background:{}\"></div></td><td><div class=g style=\"background:{}\"></div></td><td class=n>{note}</td></tr>\n",
+            png_base64(&icon, 64), title.replace('<', "&lt;"), css(&before), css(&after)
+        ));
+    }
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><title>Icon colours</title><style>body{{font:13px -apple-system;background:#1c1c1e;color:#eee;margin:16px}}table{{border-collapse:collapse;width:100%}}td,th{{padding:4px 8px;text-align:left}}th{{color:#999;font-weight:500}}img{{width:32px;height:32px;display:block}}.g{{width:180px;height:30px;border-radius:15px;background-color:#2c2c30;box-shadow:inset 0 0 0 1px #ffffff18}}.n{{color:#999}}</style>\
+         <p>{} apps · {two} with two colours · {grey} grey (accent colour). Gradients at full strength over dark glass.</p>\
+         <table><tr><th></th><th>App</th><th>Before</th><th>Now</th><th></th></tr>\n{rows}</table>",
+        apps.len()
+    );
+    let _ = std::fs::write(out, html);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn icon(parts: &[(Rgb, usize)]) -> Vec<(Rgb, f64)> {
+        parts.iter().flat_map(|&(c, n)| std::iter::repeat_n((c, 1.0), n)).collect()
+    }
+
+    fn hue(c: Rgb) -> f64 {
+        to_hsv(c).0
+    }
+
+    #[test]
+    fn finds_one_colour_inside_a_white_frame() {
+        let p = palette(&icon(&[((1.0, 1.0, 1.0), 600), ((0.12, 0.84, 0.38), 400)])).unwrap();
+        assert!((hue(p.first) - 140.0).abs() < 10.0, "{:?}", p);
+        assert_eq!(p.second, None);
+    }
+
+    #[test]
+    fn finds_two_colours() {
+        let p = palette(&icon(&[((0.86, 0.2, 0.18), 400), ((0.98, 0.78, 0.1), 250), ((1.0, 1.0, 1.0), 300)])).unwrap();
+        assert!(hue(p.first) < 15.0, "{:?}", p);
+        assert!((hue(p.second.unwrap()) - 46.0).abs() < 10.0, "{:?}", p);
+    }
+
+    #[test]
+    fn a_faint_hue_is_still_found_and_grey_is_none() {
+        let faint = palette(&icon(&[((0.62, 0.66, 0.72), 900), ((0.1, 0.1, 0.1), 100)])).unwrap();
+        assert!((hue(faint.first) - 215.0).abs() < 20.0, "{:?}", faint);
+        assert_eq!(palette(&icon(&[((0.5, 0.5, 0.5), 700), ((0.05, 0.05, 0.05), 300)])), None);
+        assert_eq!(palette(&[]), None);
     }
 }

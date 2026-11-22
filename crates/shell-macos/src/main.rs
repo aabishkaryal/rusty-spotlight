@@ -36,6 +36,14 @@ thread_local! {
 fn diagnostics(args: &[String]) -> bool {
     // rusty-spotlight --apps            list the discovered apps
     // rusty-spotlight --rank <query>    show the ranked results for a query
+    if args.len() >= 3 && args[1] == "--icon-colours" {
+        // rusty-spotlight --icon-colours OUT.html   compare glass colours per app
+        let items = apps::scan(&config::load(None).config.aliases);
+        let list: Vec<(String, String)> = items.iter().map(|i| (i.title.clone(), i.id.clone())).collect();
+        theme::diagnose(&list, &args[2]);
+        eprintln!("wrote {}", args[2]);
+        return true;
+    }
     if args.len() < 2 || (args[1] != "--apps" && args[1] != "--rank") {
         return false;
     }

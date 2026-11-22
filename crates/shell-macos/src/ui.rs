@@ -1273,6 +1273,12 @@ impl Controller {
                 })
                 .collect()
         };
+        // The launcher's own entry (Settings) never outranks a real app.
+        if let Some(own) = own_bundle() {
+            let (mut others, ours): (Vec<Row>, Vec<Row>) = rows.into_iter().partition(|r| r.id != own);
+            others.extend(ours);
+            rows = others;
+        }
         // An empty query shows only the field, as Spotlight does (Q16), unless
         // the configuration file is broken: that is said once, up front (FR-50).
         if query.is_empty() {

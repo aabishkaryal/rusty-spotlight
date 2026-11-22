@@ -16,8 +16,10 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -x rusty-spotlight 2>/dev/null || true
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$LOGS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$LOGS"
 cp target/release/rusty-spotlight "$APP/Contents/MacOS/rusty-spotlight"
+# Drawn by scripts/make-icon.swift.
+cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,6 +29,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Rusty Spotlight</string>
   <key>CFBundleDisplayName</key><string>Rusty Spotlight</string>
   <key>CFBundleExecutable</key><string>rusty-spotlight</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.0.1</string>
   <key>CFBundleVersion</key><string>1</string>
@@ -40,6 +43,8 @@ PLIST
 # The requirement names the bundle identifier instead of this build's hash, so
 # a permission granted once (Input Monitoring) still applies after a rebuild.
 codesign --force --sign - -r="designated => identifier \"$LABEL\"" "$APP"
+# Have Finder and the Dock pick up the icon of the new copy.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
 
 mkdir -p "$(dirname "$AGENT")"
 cat > "$AGENT" <<PLIST
