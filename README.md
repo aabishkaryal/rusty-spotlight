@@ -26,7 +26,7 @@ It does not search files. Return copies the answer to a sum, conversion or quest
 # 1. Rust, if you don't have it yet
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 2. The code. The repository is private, so you need access to it.
+# 2. The code
 git clone https://github.com/blackkspydo/rusty-spotlight.git
 cd rusty-spotlight
 
