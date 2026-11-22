@@ -1,0 +1,2079 @@
+//! The panel and its controller. Everything here runs on the main thread.
+//!
+//! Ranking is synchronous (about 10 µs over the app catalog), so what is in
+//! `State::rows` is exactly what the table shows after `present()` returns.
+//! Return, click and completion all read that one presentation (FR-14).
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use launcher_core::calc;
+use launcher_core::rank::completion;
+use launcher_core::text::fold;
+use launcher_core::{Item, Ranker, Usage};
+use objc2::rc::Retained;
+use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackgroundStyle, NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSColor, NSControl,
+    NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont,
+    NSFontWeightMedium, NSGlassEffectView, NSImage, NSImageScaling, NSImageView,
+    NSModalPanelWindowLevel, NSPanel, NSPasteboard, NSPasteboardTypeString, NSPopUpMenuWindowLevel, NSScreen, NSScreenSaverWindowLevel,
+    NSScrollView, NSStatusWindowLevel, NSTableColumn, NSTableRowView, NSTableView,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewSelectionHighlightStyle,
+    NSTableViewStyle, NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextInputTraitType, NSTextView, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceOpenConfiguration,
+};
+use objc2_foundation::{
+    NSDate, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject, NSTimer, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSTimeZone, NSURL,
+};
+
+use crate::{apps, ask, config, rates, store};
+
+// Sizes in points, measured from Spotlight (docs/REQUIREMENTS.md, section 5.5).
+const PANEL_W: f64 = 640.0;
+const FIELD_H: f64 = 56.0;
+const ROW_H: f64 = 56.0;
+const RADIUS: f64 = 28.0;
+const TEXT_X: f64 = 61.0;
+const MAX_ROWS: usize = 7;
+const LIST_PAD_TOP: f64 = 6.0;
+const LIST_PAD_BOTTOM: f64 = 8.0;
+/// Transparent border of the window around the visible panel, so the panel
+/// can be drawn larger than its resting size while it animates in.
+const MARGIN: f64 = 48.0;
+/// Height of the panel with every row showing. The window is always this tall
+/// (plus margins); only the visible surface inside it changes size.
+const MAX_H: f64 = FIELD_H + LIST_PAD_TOP + ROW_H * MAX_ROWS as f64 + LIST_PAD_BOTTOM;
+
+fn env(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// One line per summon and per dismissal, with the app in front, so a report
+/// of "it did not open" can be matched to what actually happened. Always on:
+/// a few lines per use, written to the log file the login item points at.
+pub fn event_log(what: &str) {
+    let front = NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|a| a.localizedName())
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let secs = now() as u64 % 86_400;
+    eprintln!("[rs] {:02}:{:02}:{:02} UTC {what} | front={front}", secs / 3600, secs / 60 % 60, secs % 60);
+}
+
+fn debug() -> bool {
+    std::env::var_os("RS_DEBUG").is_some()
+}
+
+fn now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn ns(s: &str) -> Retained<NSString> {
+    NSString::from_str(s)
+}
+
+thread_local! {
+    /// Until when a loss of key status is attributed to an app we just launched.
+    static LAUNCH_GRACE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// The app that was in front when the panel was summoned.
+    static SHOWN_OVER: Cell<i32> = const { Cell::new(-1) };
+    /// How many times the panel has taken the keyboard back since it was shown.
+    static RETAKES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A window that keeps taking the keyboard is not fought forever.
+const MAX_RETAKES: u32 = 4;
+
+fn frontmost_pid() -> i32 {
+    NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier()).unwrap_or(-1)
+}
+
+fn front_name() -> String {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|a| a.localizedName())
+        .map(|n| n.to_string())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- panel
+
+define_class!(
+    #[unsafe(super(NSPanel))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RSLauncherPanel"]
+    pub struct LauncherPanel;
+
+    impl LauncherPanel {
+        // A borderless panel refuses key status unless this says yes.
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(canBecomeMainWindow))]
+        fn can_become_main_window(&self) -> bool {
+            false
+        }
+
+        // An agent app has no Edit menu, so the standard editing shortcuts
+        // would go nowhere. Route them to the field editor here.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
+            self.edit_shortcut(event) || unsafe { msg_send![super(self), performKeyEquivalent: event] }
+        }
+
+        // Losing key status usually means a click elsewhere, but an input-method
+        // palette or a menu can take it for a moment. Decide on the next turn of
+        // the run loop, and never order out from inside resignKey itself.
+        #[unsafe(method(resignKeyWindow))]
+        fn resign_key_window(&self) {
+            let _: () = unsafe { msg_send![super(self), resignKeyWindow] };
+            let _: () = unsafe {
+                msg_send![
+                    self,
+                    performSelector: sel!(rsHideIfNotKey),
+                    withObject: Option::<&AnyObject>::None,
+                    afterDelay: 0.0f64,
+                ]
+            };
+        }
+
+        #[unsafe(method(rsHideIfNotKey))]
+        fn hide_if_not_key(&self) {
+            if !self.isVisible() || self.isKeyWindow() {
+                return;
+            }
+            // A mouse button being down means a click elsewhere: the user left.
+            if NSEvent::pressedMouseButtons() != 0 {
+                event_log("hidden: clicked elsewhere");
+                self.orderOut(None);
+                return;
+            }
+            // No click. Either the user switched apps from the keyboard, or an
+            // app grabbed the keyboard by itself (T3 Code refocusing its input,
+            // an app this launcher just opened finishing its start). Wait a
+            // moment so the frontmost app is current, then decide.
+            let _: () = unsafe {
+                msg_send![
+                    self,
+                    performSelector: sel!(rsRetakeOrHide),
+                    withObject: Option::<&AnyObject>::None,
+                    afterDelay: 0.12f64,
+                ]
+            };
+        }
+
+        #[unsafe(method(rsRetakeOrHide))]
+        fn retake_or_hide(&self) {
+            if !self.isVisible() || self.isKeyWindow() {
+                return;
+            }
+            let in_grace = LAUNCH_GRACE.get().is_some_and(|until| std::time::Instant::now() < until);
+            let same_app = frontmost_pid() == SHOWN_OVER.get();
+            let clicked = NSEvent::pressedMouseButtons() != 0;
+            if !clicked && (in_grace || same_app) && RETAKES.get() < MAX_RETAKES {
+                RETAKES.set(RETAKES.get() + 1);
+                event_log(&format!("kept: keyboard taken back from {}", front_name()));
+                self.makeKeyWindow();
+                return;
+            }
+            event_log("hidden: another app took the keyboard");
+            self.orderOut(None);
+        }
+    }
+);
+
+impl LauncherPanel {
+    fn edit_shortcut(&self, event: &NSEvent) -> bool {
+        let flags = event.modifierFlags();
+        let command_only = flags.contains(NSEventModifierFlags::Command)
+            && !flags.contains(NSEventModifierFlags::Control)
+            && !flags.contains(NSEventModifierFlags::Option);
+        if !command_only {
+            return false;
+        }
+        let key = event.charactersIgnoringModifiers().map(|c| c.to_string().to_lowercase());
+        let shift = flags.contains(NSEventModifierFlags::Shift);
+        let action = match (key.as_deref(), shift) {
+            (Some("a"), false) => sel!(selectAll:),
+            (Some("c"), false) => sel!(copy:),
+            (Some("v"), false) => sel!(paste:),
+            (Some("x"), false) => sel!(cut:),
+            (Some("z"), false) => sel!(undo:),
+            (Some("z"), true) => sel!(redo:),
+            (Some("k"), false) => sel!(rsShowActions:),
+            _ => return false,
+        };
+        let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
+        unsafe { app.sendAction_to_from(action, None, Some(self)) }
+    }
+}
+
+// ---------------------------------------------------------------- row view
+
+#[derive(Default)]
+struct RowIvars {
+    card: Cell<bool>,
+}
+
+define_class!(
+    #[unsafe(super(NSTableRowView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RSRowView"]
+    #[ivars = RowIvars]
+    struct RowView;
+
+    impl RowView {
+        // Spotlight's selection: a neutral translucent fill, inset, rounded (DS-3b).
+        #[unsafe(method(drawSelectionInRect:))]
+        fn draw_selection(&self, _dirty: NSRect) {
+            if self.ivars().card.get() {
+                return;
+            }
+            let b = self.bounds();
+            let rect = NSRect::new(
+                NSPoint::new(b.origin.x + 9.0, b.origin.y + 0.5),
+                NSSize::new(b.size.width - 18.0, b.size.height - 1.0),
+            );
+            NSColor::labelColor().colorWithAlphaComponent(0.16).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 18.0, 18.0).fill();
+        }
+
+        // Keep label colours as they are on a selected row; the fill is neutral, not accent.
+        #[unsafe(method(interiorBackgroundStyle))]
+        fn interior_background_style(&self) -> NSBackgroundStyle {
+            NSBackgroundStyle::Normal
+        }
+
+        #[unsafe(method(isEmphasized))]
+        fn is_emphasized(&self) -> bool {
+            false
+        }
+    }
+);
+
+// ---------------------------------------------------------------- controller
+
+/// What Return does with a presented row.
+#[derive(Clone)]
+enum Kind {
+    App { running: bool },
+    /// Open a web address in the default browser.
+    Link { url: String },
+    /// A calculation or conversion: Return copies `copy`.
+    Value { expression: String, copy: String, note: Option<String> },
+    /// A question for an assistant tool: Return sends it (or retries).
+    Ask { tool: String, question: String, pending: bool },
+    /// Something the user should know (a broken configuration file): Return opens `path`.
+    Notice { path: String },
+    /// The tool's answer: Return copies it.
+    Answer { tool: String, text: String, height: f64, truncated: bool },
+    /// One of the selected row's actions, listed by Command-K (FR-40).
+    Action { act: Act, symbol: &'static str },
+}
+
+/// What a Command-K action does.
+#[derive(Clone)]
+enum Act {
+    /// What Return does on the row the actions are for.
+    Primary,
+    Reveal(String),
+    Copy(String),
+    Quit { path: String, force: bool },
+    /// Ask the same question with another tool.
+    AskWith { tool: String, question: String },
+}
+
+/// One presented row. Return, click and the completion all act on this, never
+/// on a fresh ranking or a newer rate (FR-14, FR-19).
+#[derive(Clone)]
+struct Row {
+    id: String,
+    title: String,
+    subtitle: Option<String>,
+    kind: Kind,
+}
+
+impl Row {
+    fn action(&self) -> &'static str {
+        match self.kind {
+            Kind::App { running: true } => "Switch",
+            Kind::App { running: false } | Kind::Link { .. } => "Open",
+            Kind::Value { .. } | Kind::Answer { .. } => "Copy",
+            Kind::Ask { pending: true, .. } => "",
+            Kind::Ask { .. } => "Ask",
+            Kind::Notice { .. } => "Open",
+            Kind::Action { .. } => "Run",
+        }
+    }
+
+    fn height(&self) -> f64 {
+        match &self.kind {
+            Kind::Value { note: Some(_), .. } => 94.0,
+            Kind::Value { note: None, .. } => 72.0,
+            Kind::Answer { height, .. } => *height,
+            _ => ROW_H,
+        }
+    }
+}
+
+/// One question sent to an assistant tool, and what came back.
+struct AskRun {
+    /// The whole typed query it belongs to; a different query abandons it.
+    query: String,
+    request: Option<ask::Request>,
+    outcome: Option<Result<String, String>>,
+}
+
+pub struct State {
+    panel: Retained<LauncherPanel>,
+    /// The visible rounded panel (glass or blur), inset by MARGIN in the window.
+    surface: Retained<NSView>,
+    /// Sits behind the surface and carries the panel's drop shadow.
+    shadow: Retained<NSView>,
+    #[allow(dead_code)] // kept alive here; laid out once at build
+    content: Retained<NSView>,
+    field: Retained<NSTextField>,
+    completion: Retained<NSTextField>,
+    /// The selected result's icon at the trailing edge of the field, as Spotlight shows.
+    field_icon: Retained<NSImageView>,
+    measure: Retained<NSTextField>,
+    separator: Retained<NSBox>,
+    scroll: Retained<NSScrollView>,
+    table: Retained<NSTableView>,
+    items: RefCell<Vec<Item>>,
+    config: RefCell<config::Config>,
+    config_modified: Cell<Option<std::time::SystemTime>>,
+    config_error: RefCell<Option<String>>,
+    usage: RefCell<Usage>,
+    ranker: RefCell<Ranker>,
+    rows: RefCell<Vec<Row>>,
+    /// While Command-K's actions are listed: the rows and selection they replaced.
+    actions: RefCell<Option<(Vec<Row>, usize)>>,
+    query: RefCell<String>,
+    selected: Cell<usize>,
+    running: RefCell<HashSet<String>>,
+    icons: RefCell<HashMap<String, Retained<NSImage>>>,
+    /// Rows the surface is currently sized for.
+    shown_height: Cell<f64>,
+    ask: RefCell<Option<AskRun>>,
+    ask_timer: RefCell<Option<Retained<NSTimer>>>,
+    /// Height animation in flight: (from, to, start time), stepped by `spring_timer`.
+    spring: Cell<Option<(f64, f64, std::time::Instant)>>,
+    spring_timer: RefCell<Option<Retained<NSTimer>>>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RSController"]
+    #[ivars = State]
+    pub struct Controller;
+
+    unsafe impl NSObjectProtocol for Controller {}
+
+    // Opening the app again from Finder while it runs (the only way back when
+    // the menu bar icon is hidden) shows the settings.
+    unsafe impl NSApplicationDelegate for Controller {
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn should_handle_reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
+            crate::settings::show(self);
+            false
+        }
+    }
+
+    unsafe impl NSControlTextEditingDelegate for Controller {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _n: &NSNotification) {
+            let text = self.ivars().field.stringValue().to_string();
+            *self.ivars().query.borrow_mut() = text;
+            self.present();
+        }
+
+        // Keys the field editor did not consume as text. While an input method
+        // is composing, the editor gets first refusal on everything (FR-7).
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn do_command(&self, _control: &NSControl, text_view: &NSTextView, command: Sel) -> bool {
+            self.handle_command(text_view, command)
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for Controller {}
+
+    unsafe impl NSTableViewDataSource for Controller {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows(&self, _table: &NSTableView) -> NSInteger {
+            self.ivars().rows.borrow().len() as NSInteger
+        }
+    }
+
+    unsafe impl NSTableViewDelegate for Controller {
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn view_for_row(
+            &self,
+            _table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> Option<Retained<NSView>> {
+            self.cell_for(row as usize)
+        }
+
+        #[unsafe(method_id(tableView:rowViewForRow:))]
+        fn row_view(&self, _table: &NSTableView, row: NSInteger) -> Option<Retained<NSTableRowView>> {
+            let view = RowView::alloc(self.mtm()).set_ivars(RowIvars::default());
+            let view: Retained<RowView> = unsafe { msg_send![super(view), init] };
+            // A result card is its own highlight; it gets no selection fill.
+            let card = matches!(
+                self.ivars().rows.borrow().get(row as usize).map(|r| &r.kind),
+                Some(Kind::Value { .. } | Kind::Answer { .. })
+            );
+            view.ivars().card.set(card);
+            Some(Retained::into_super(view))
+        }
+
+        #[unsafe(method(tableView:heightOfRow:))]
+        fn height_of_row(&self, _table: &NSTableView, row: NSInteger) -> f64 {
+            self.ivars().rows.borrow().get(row as usize).map_or(ROW_H, Row::height)
+        }
+    }
+
+    impl Controller {
+        #[unsafe(method(rowClicked:))]
+        fn row_clicked(&self, _sender: Option<&AnyObject>) {
+            let row = self.ivars().table.clickedRow();
+            if row >= 0 && (row as usize) < self.ivars().rows.borrow().len() {
+                self.ivars().selected.set(row as usize);
+                self.activate();
+            }
+        }
+
+        #[unsafe(method(askTick:))]
+        fn ask_tick(&self, _timer: Option<&AnyObject>) {
+            self.poll_ask();
+        }
+
+        #[unsafe(method(springTick:))]
+        fn spring_tick(&self, _timer: Option<&AnyObject>) {
+            self.step_spring();
+        }
+
+        #[unsafe(method(showPanel:))]
+        fn show_panel(&self, _sender: Option<&AnyObject>) {
+            self.show();
+        }
+
+        #[unsafe(method(showSettings:))]
+        fn show_settings(&self, _sender: Option<&AnyObject>) {
+            self.dismiss();
+            crate::settings::show(self);
+        }
+
+        #[unsafe(method(toggleMenuBarIcon:))]
+        fn toggle_menu_bar_icon(&self, sender: Option<&AnyObject>) {
+            crate::settings::toggled(sender);
+        }
+
+        // Command-K, sent up the responder chain from the panel.
+        #[unsafe(method(rsShowActions:))]
+        fn show_actions(&self, _sender: Option<&AnyObject>) {
+            self.toggle_actions();
+        }
+
+        #[unsafe(method(openInputMonitoring:))]
+        fn open_input_monitoring(&self, _sender: Option<&AnyObject>) {
+            crate::keytap::open_settings();
+        }
+
+        #[unsafe(method(openConfigFile:))]
+        fn open_config_file(&self, _sender: Option<&AnyObject>) {
+            if let Some(path) = config::path() {
+                NSWorkspace::sharedWorkspace().openURL(&NSURL::fileURLWithPath(&ns(&path.to_string_lossy())));
+            }
+        }
+    }
+);
+
+impl Controller {
+    // Keys the field editor did not consume as text. While an input method is
+    // composing, the editor gets first refusal on everything (FR-7).
+    fn handle_command(&self, text_view: &NSTextView, command: Sel) -> bool {
+        if text_view.hasMarkedText() {
+            return false;
+        }
+        if command == sel!(moveDown:) {
+            self.move_selection(1);
+        } else if command == sel!(moveUp:) {
+            self.move_selection(-1);
+        } else if command == sel!(insertNewline:) {
+            self.activate();
+        } else if command == sel!(cancelOperation:) {
+            if !self.leave_actions() {
+                self.dismiss();
+            }
+        } else if command == sel!(moveRight:) || command == sel!(insertTab:) {
+            return self.accept_completion(text_view);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn cell_for(&self, row: usize) -> Option<Retained<NSView>> {
+        let row_data = self.ivars().rows.borrow().get(row).cloned()?;
+        Some(self.cell(&row_data, row == self.ivars().selected.get()))
+    }
+
+    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_W, FIELD_H));
+        let full = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_W, MAX_H));
+        let window_rect = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(PANEL_W + 2.0 * MARGIN, MAX_H + 2.0 * MARGIN),
+        );
+        let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
+        let panel: Retained<LauncherPanel> = unsafe {
+            msg_send![
+                LauncherPanel::alloc(mtm),
+                initWithContentRect: window_rect,
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: false,
+            ]
+        };
+        // The level and Space behaviour stay switchable until the fullscreen,
+        // Stage Manager and second-display checks of spike S1 have been done by hand.
+        let level = match env("RS_LEVEL", "popup").as_str() {
+            "floating" => NSFloatingWindowLevel,
+            "modal" => NSModalPanelWindowLevel,
+            "status" => NSStatusWindowLevel,
+            "screensaver" => NSScreenSaverWindowLevel,
+            _ => NSPopUpMenuWindowLevel,
+        };
+        let behavior = match env("RS_BEHAVIOR", "a").as_str() {
+            "b" => {
+                NSWindowCollectionBehavior::CanJoinAllApplications
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | NSWindowCollectionBehavior::IgnoresCycle
+            }
+            "c" => {
+                NSWindowCollectionBehavior::MoveToActiveSpace
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | NSWindowCollectionBehavior::IgnoresCycle
+            }
+            _ => {
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | NSWindowCollectionBehavior::Stationary
+                    | NSWindowCollectionBehavior::IgnoresCycle
+            }
+        };
+        // Order matters: setFloatingPanel(true) forces the floating level, so the
+        // level has to be set after it.
+        panel.setFloatingPanel(true);
+        panel.setLevel(level);
+        panel.setCollectionBehavior(behavior);
+        if debug() {
+            eprintln!("[rs] panel level={} behavior={:#x}", panel.level(), behavior.0);
+        }
+        panel.setHidesOnDeactivate(false);
+        panel.setBecomesKeyOnlyIfNeeded(false);
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        // The window shadow is rectangular; the rounded glass draws its own edge.
+        panel.setHasShadow(false);
+        panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
+        unsafe { panel.setReleasedWhenClosed(false) };
+
+        // `content` is always full height and pinned to the top of `clip`, which
+        // is what the glass shows. Growing the panel only reveals more of it, so
+        // nothing inside has to move while the surface animates.
+        let content = NSView::initWithFrame(NSView::alloc(mtm), full);
+        content.setFrameOrigin(NSPoint::new(0.0, FIELD_H - MAX_H));
+        content.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin);
+        let clip = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        clip.addSubview(&content);
+
+        let field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(TEXT_X, MAX_H - FIELD_H + 11.0), NSSize::new(PANEL_W - TEXT_X - 60.0, 34.0)),
+        );
+        field.setBordered(false);
+        field.setBezeled(false);
+        field.setDrawsBackground(false);
+        field.setFocusRingType(NSFocusRingType::None);
+        // One line that scrolls sideways, never wraps.
+        field.setUsesSingleLineMode(true);
+        field.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByClipping);
+        if let Some(cell) = field.cell() {
+            cell.setScrollable(true);
+            cell.setWraps(false);
+        }
+        field.setFont(Some(&NSFont::systemFontOfSize(25.0)));
+        field.setPlaceholderString(Some(&ns("Search")));
+        field.setTextColor(Some(&strong_label(mtm)));
+        // No system suggestion popups under the field: this panel draws its own results.
+        field.setAutomaticTextCompletionEnabled(false);
+        field.setAllowsWritingTools(false);
+        field.setAllowsWritingToolsAffordance(false);
+        content.addSubview(&field);
+
+        let glyph = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns("magnifyingglass"), None)
+            .and_then(|g| {
+                let config = objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(
+                    24.0,
+                    unsafe { NSFontWeightMedium },
+                );
+                g.imageWithSymbolConfiguration(&config)
+            });
+        if let Some(glyph) = glyph {
+            let view = NSImageView::imageViewWithImage(&glyph, mtm);
+            view.setContentTintColor(Some(&NSColor::labelColor().colorWithAlphaComponent(0.62)));
+            view.setImageScaling(NSImageScaling::ScaleNone);
+            view.setFrame(NSRect::new(NSPoint::new(17.0, MAX_H - FIELD_H + (FIELD_H - 32.0) / 2.0), NSSize::new(32.0, 32.0)));
+            content.addSubview(&view);
+        }
+
+        // Inline completion (DS-3a): drawn after the typed text, not editable.
+        let completion = NSTextField::labelWithString(&ns(""), mtm);
+        completion.setFont(Some(&NSFont::systemFontOfSize(25.0)));
+        completion.setTextColor(Some(&NSColor::labelColor().colorWithAlphaComponent(0.72)));
+        completion.setDrawsBackground(true);
+        completion.setBackgroundColor(Some(&NSColor::labelColor().colorWithAlphaComponent(0.17)));
+        completion.setWantsLayer(true);
+        unsafe {
+            let layer: Option<Retained<AnyObject>> = msg_send![&*completion, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![&*layer, setCornerRadius: 8.0f64];
+                let _: () = msg_send![&*layer, setMasksToBounds: true];
+            }
+        }
+        completion.setHidden(true);
+        content.addSubview(&completion);
+
+        let field_icon = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(PANEL_W - 19.0 - 32.0, MAX_H - FIELD_H + (FIELD_H - 32.0) / 2.0),
+                NSSize::new(32.0, 32.0),
+            ),
+        );
+        field_icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        field_icon.setHidden(true);
+        content.addSubview(&field_icon);
+
+        // Never shown: used to measure the width of the typed text in the field's font.
+        let measure = NSTextField::labelWithString(&ns(""), mtm);
+        measure.setFont(Some(&NSFont::systemFontOfSize(25.0)));
+
+        let separator = NSBox::initWithFrame(
+            NSBox::alloc(mtm),
+            NSRect::new(NSPoint::new(19.0, MAX_H - FIELD_H - 1.0), NSSize::new(PANEL_W - 38.0, 1.0)),
+        );
+        separator.setBoxType(NSBoxType::Separator);
+        content.addSubview(&separator);
+
+        let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), rect);
+        let column = NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), &ns("main"));
+        column.setWidth(PANEL_W);
+        table.addTableColumn(&column);
+        table.setHeaderView(None);
+        table.setRowHeight(ROW_H);
+        table.setIntercellSpacing(NSSize::new(0.0, 0.0));
+        table.setBackgroundColor(&NSColor::clearColor());
+        table.setStyle(NSTableViewStyle::FullWidth);
+        table.setSelectionHighlightStyle(NSTableViewSelectionHighlightStyle::Regular);
+        table.setRefusesFirstResponder(true);
+        table.setAllowsEmptySelection(true);
+
+        let scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, LIST_PAD_BOTTOM), NSSize::new(PANEL_W, ROW_H * MAX_ROWS as f64)),
+        );
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(false);
+        scroll.setDocumentView(Some(&table));
+        content.addSubview(&scroll);
+
+        let root = NSView::initWithFrame(NSView::alloc(mtm), window_rect);
+        root.setWantsLayer(true);
+        let surface: Retained<NSView> = if env("RS_MATERIAL", "glass") == "blur" {
+            let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
+            blur.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            blur.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            blur.setState(NSVisualEffectState::Active);
+            blur.setWantsLayer(true);
+            unsafe {
+                let layer: Option<Retained<AnyObject>> = msg_send![&*blur, layer];
+                if let Some(layer) = layer {
+                    let _: () = msg_send![&*layer, setCornerRadius: RADIUS];
+                    let _: () = msg_send![&*layer, setMasksToBounds: true];
+                }
+            }
+            clip.setAutoresizingMask(
+                objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+                    | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            blur.addSubview(&clip);
+            Retained::into_super(blur)
+        } else {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), rect);
+            glass.setCornerRadius(RADIUS);
+            if env("RS_GLASS", "regular") == "clear" {
+                glass.setStyle(objc2_app_kit::NSGlassEffectViewStyle::Clear);
+            }
+            glass.setContentView(Some(&clip));
+            Retained::into_super(glass)
+        };
+        surface.setWantsLayer(true);
+        // The drop shadow is a rounded shadow path on a layer of its own; the
+        // window's own shadow is rectangular and stays off.
+        let shadow = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        shadow.setWantsLayer(true);
+        unsafe {
+            let layer: Option<Retained<AnyObject>> = msg_send![&*shadow, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![&*layer, setMasksToBounds: false];
+            }
+        }
+        // AppKit owns a layer-backed view's shadow settings, so they are given
+        // to the view; only the path is set on the layer directly.
+        let drop = objc2_app_kit::NSShadow::new();
+        drop.setShadowColor(Some(&NSColor::blackColor().colorWithAlphaComponent(0.5)));
+        drop.setShadowBlurRadius(26.0);
+        drop.setShadowOffset(NSSize::new(0.0, -12.0));
+        shadow.setShadow(Some(&drop));
+        root.addSubview(&shadow);
+        root.addSubview(&surface);
+        panel.setContentView(Some(&root));
+
+        let state = State {
+            panel,
+            surface,
+            shadow,
+            content,
+            field,
+            completion,
+            field_icon,
+            measure,
+            separator,
+            scroll,
+            table,
+            items: RefCell::new(Vec::new()),
+            config: RefCell::new(config::Config::default()),
+            config_modified: Cell::new(None),
+            config_error: RefCell::new(None),
+            usage: RefCell::new(store::load()),
+            ranker: RefCell::new(Ranker::default()),
+            rows: RefCell::new(Vec::new()),
+            actions: RefCell::new(None),
+            query: RefCell::new(String::new()),
+            selected: Cell::new(0),
+            running: RefCell::new(HashSet::new()),
+            icons: RefCell::new(HashMap::new()),
+            shown_height: Cell::new(0.0),
+            ask: RefCell::new(None),
+            ask_timer: RefCell::new(None),
+            spring: Cell::new(None),
+            spring_timer: RefCell::new(None),
+        };
+        let this = Self::alloc(mtm).set_ivars(state);
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+
+        let s = this.ivars();
+        unsafe {
+            let delegate: &AnyObject = &this;
+            let _: () = msg_send![&*s.field, setDelegate: delegate];
+            let _: () = msg_send![&*s.table, setDelegate: delegate];
+            let _: () = msg_send![&*s.table, setDataSource: delegate];
+            let _: () = msg_send![&*s.table, setTarget: delegate];
+            s.table.setAction(Some(sel!(rowClicked:)));
+        }
+        this.reload_config(true);
+        this.layout(0.0, false);
+        this
+    }
+
+    // ------------------------------------------------------------ show / hide
+
+    pub fn toggle(&self) {
+        if self.ivars().panel.isVisible() {
+            self.dismiss();
+        } else {
+            self.show();
+        }
+    }
+
+    pub fn show(&self) {
+        let s = self.ivars();
+        let t = std::time::Instant::now();
+        *s.running.borrow_mut() = running_bundle_paths();
+        if config::changed_since(s.config_modified.get()) {
+            self.reload_config(false);
+        }
+        SHOWN_OVER.set(frontmost_pid());
+        RETAKES.set(0);
+        s.field.setStringValue(&ns(""));
+        s.query.borrow_mut().clear();
+        self.place();
+        self.present();
+        s.panel.orderFrontRegardless();
+        s.panel.makeKeyWindow();
+        let focused = s.panel.makeFirstResponder(Some(&s.field));
+        // The shared field editor carries its own typing aids; turn them off too.
+        if let Some(editor) = s.field.currentEditor() {
+            if let Ok(editor) = editor.downcast::<NSTextView>() {
+                editor.setInlinePredictionType(NSTextInputTraitType::No);
+                editor.setMathExpressionCompletionType(NSTextInputTraitType::No);
+                editor.setAutomaticTextCompletionEnabled(false);
+                editor.setContinuousSpellCheckingEnabled(false);
+            }
+        }
+        self.animate_in();
+        let shown_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // Refresh the catalog after the panel is up, so a scan never delays the
+        // summon. Re-present only if it changed and nothing has been typed yet.
+        let fresh = self.scan_apps();
+        let changed = {
+            let items = s.items.borrow();
+            fresh.len() != items.len() || fresh.iter().zip(items.iter()).any(|(a, b)| a.id != b.id)
+        };
+        if changed {
+            *s.items.borrow_mut() = fresh;
+            if !s.query.borrow().is_empty() {
+                self.present();
+            }
+        }
+        event_log(&format!(
+            "shown in {shown_ms:.1} ms (key={} focus={focused}, rescan {:.1} ms)",
+            s.panel.isKeyWindow(),
+            t.elapsed().as_secs_f64() * 1000.0 - shown_ms
+        ));
+    }
+
+    /// Spotlight's opening animation, measured from a 60 fps recording over a
+    /// black card on macOS 27.2: the field is first visible at about 110% of
+    /// its width and 96% of its height, and reaches its resting shape in
+    /// about 125 ms with almost no overshoot (0.2%), fading in over about
+    /// 75 ms. Purely visual: the field already has focus.
+    /// Skipped under Reduce Motion or with RS_ANIM=off.
+    fn animate_in(&self) {
+        if env("RS_ANIM", "on") == "off"
+            || NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        {
+            return;
+        }
+        let s = self.ivars();
+        let layer: Option<Retained<AnyObject>> = unsafe { msg_send![&*s.surface, layer] };
+        let Some(layer) = layer else { return };
+        let size = s.surface.frame().size;
+        const FROM_X: f64 = 1.12;
+        const FROM_Y: f64 = 0.95;
+
+        // The layer's anchor is its bottom-left corner, so each scale is paired
+        // with a translation on the same curve to keep the centre fixed.
+        let spring = |key: &str, from: f64, to: f64| -> Option<Retained<AnyObject>> {
+            let class = AnyClass::get(c"CASpringAnimation")?;
+            unsafe {
+                let a: Retained<AnyObject> = msg_send![class, animationWithKeyPath: &*ns(key)];
+                // Damping ratio about 0.76 at about 45 rad/s.
+                let _: () = msg_send![&*a, setMass: 1.0f64];
+                let _: () = msg_send![&*a, setStiffness: 2000.0f64];
+                let _: () = msg_send![&*a, setDamping: 68.0f64];
+                let _: () = msg_send![&*a, setFromValue: &*NSNumber::new_f64(from)];
+                let _: () = msg_send![&*a, setToValue: &*NSNumber::new_f64(to)];
+                let settle: f64 = msg_send![&*a, settlingDuration];
+                let _: () = msg_send![&*a, setDuration: settle];
+                Some(a)
+            }
+        };
+        let animations = [
+            ("rs.sx", spring("transform.scale.x", FROM_X, 1.0)),
+            ("rs.sy", spring("transform.scale.y", FROM_Y, 1.0)),
+            ("rs.tx", spring("transform.translation.x", size.width * (1.0 - FROM_X) / 2.0, 0.0)),
+            ("rs.ty", spring("transform.translation.y", size.height * (1.0 - FROM_Y) / 2.0, 0.0)),
+        ];
+        for (key, animation) in animations {
+            if let Some(animation) = animation {
+                let _: () = unsafe { msg_send![&*layer, addAnimation: &*animation, forKey: &*ns(key)] };
+            }
+        }
+        if let Some(class) = AnyClass::get(c"CABasicAnimation") {
+            unsafe {
+                let fade: Retained<AnyObject> = msg_send![class, animationWithKeyPath: &*ns("opacity")];
+                let _: () = msg_send![&*fade, setFromValue: &*NSNumber::new_f64(0.0)];
+                let _: () = msg_send![&*fade, setToValue: &*NSNumber::new_f64(1.0)];
+                let _: () = msg_send![&*fade, setDuration: 0.075f64];
+                let _: () = msg_send![&*layer, addAnimation: &*fade, forKey: &*ns("rs.fade")];
+            }
+        }
+    }
+
+    /// A newer exchange rate arrived: redraw, if the panel is showing a conversion.
+    pub fn rates_updated(&self) {
+        let s = self.ivars();
+        let showing = s.rows.borrow().iter().any(|r| r.id == "convert");
+        if s.panel.isVisible() && showing {
+            let selected = s.selected.get();
+            self.present();
+            let len = s.rows.borrow().len();
+            if selected < len && selected != 0 {
+                s.selected.set(selected);
+                self.reload();
+                self.update_completion();
+            }
+        }
+    }
+
+    pub fn dismiss(&self) {
+        self.cancel_ask();
+        let panel = self.ivars().panel.clone();
+        if panel.isVisible() {
+            event_log("hidden: dismissed");
+            panel.orderOut(None);
+        }
+    }
+
+    /// Pick the screen under the pointer and fix the panel's top edge on it.
+    fn place(&self) {
+        let mtm = self.mtm();
+        let mouse = NSEvent::mouseLocation();
+        let mut chosen = None;
+        for screen in NSScreen::screens(mtm).iter() {
+            let f = screen.frame();
+            if mouse.x >= f.origin.x
+                && mouse.x < f.origin.x + f.size.width
+                && mouse.y >= f.origin.y
+                && mouse.y < f.origin.y + f.size.height
+            {
+                chosen = Some(screen);
+                break;
+            }
+        }
+        let Some(screen) = chosen.or_else(|| NSScreen::mainScreen(mtm)) else { return };
+        let f = screen.frame();
+        let v = screen.visibleFrame();
+        // Spotlight: centred, top edge about 28% down the screen; kept inside the visible area.
+        let top = (f.origin.y + f.size.height * (1.0 - 0.28)).min(v.origin.y + v.size.height - 8.0);
+        let x = f.origin.x + (f.size.width - PANEL_W) / 2.0 - MARGIN;
+        let s = self.ivars();
+        let size = s.panel.frame().size;
+        s.panel.setFrame_display(
+            NSRect::new(NSPoint::new(x.round(), top.round() + MARGIN - size.height), size),
+            false,
+        );
+    }
+
+    /// Size the visible surface for `rows` result rows. Its top edge never
+    /// moves; it grows downward inside the fixed window. With `animate`, the
+    /// height follows Spotlight's own spring (see `spring_progress`).
+    fn layout(&self, rows_height: f64, animate: bool) {
+        let s = self.ivars();
+        let rows = rows_height > 0.0;
+        let list_h = if rows { LIST_PAD_TOP + rows_height + LIST_PAD_BOTTOM } else { 0.0 };
+        let h = FIELD_H + list_h;
+        s.separator.setHidden(!rows);
+        s.scroll.setHidden(!rows);
+        s.shown_height.set(rows_height);
+
+        let animate = animate
+            && env("RS_ANIM", "on") != "off"
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        if !animate {
+            self.stop_spring();
+            self.set_height(h);
+            return;
+        }
+        let from = s.surface.frame().size.height;
+        s.spring.set(Some((from, h, std::time::Instant::now())));
+        if s.spring_timer.borrow().is_none() {
+            let timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    1.0 / 120.0,
+                    self,
+                    sel!(springTick:),
+                    None,
+                    true,
+                )
+            };
+            *s.spring_timer.borrow_mut() = Some(timer);
+        }
+    }
+
+    fn set_height(&self, h: f64) {
+        let s = self.ivars();
+        let frame = NSRect::new(NSPoint::new(MARGIN, MARGIN + MAX_H - h), NSSize::new(PANEL_W, h));
+        s.shadow.setFrame(frame);
+        update_shadow(&s.shadow, PANEL_W, h);
+        s.surface.setFrame(frame);
+    }
+
+    fn stop_spring(&self) {
+        let s = self.ivars();
+        s.spring.set(None);
+        if let Some(timer) = s.spring_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+    }
+
+    fn step_spring(&self) {
+        let Some((from, to, start)) = self.ivars().spring.get() else {
+            self.stop_spring();
+            return;
+        };
+        let t = start.elapsed().as_secs_f64();
+        if t >= SPRING_SETTLE {
+            self.stop_spring();
+            self.set_height(to);
+            return;
+        }
+        let h = from + (to - from) * spring_progress(t);
+        self.set_height(h.max(FIELD_H * 0.8));
+    }
+
+    // ------------------------------------------------------------ results
+
+    /// Read the configuration and rebuild the catalog with its aliases.
+    fn reload_config(&self, first: bool) {
+        let s = self.ivars();
+        let previous = (!first).then(|| s.config.borrow().clone());
+        let loaded = config::load(previous.as_ref());
+        *s.config.borrow_mut() = loaded.config;
+        s.config_modified.set(loaded.modified);
+        if let Some(error) = &loaded.error {
+            eprintln!("[rs] config.toml: {error}");
+        }
+        *s.config_error.borrow_mut() = loaded.error;
+        crate::settings::set_icon_visible(s.config.borrow().menu_bar_icon);
+        let items = self.scan_apps();
+        *s.items.borrow_mut() = items;
+    }
+
+    fn scan_apps(&self) -> Vec<Item> {
+        let config = self.ivars().config.borrow();
+        let mut items = apps::scan(&config.aliases);
+        // This app's own entry opens its settings; launching it again would
+        // only start a second copy.
+        if let Some(own) = own_bundle() {
+            if let Some(item) = items.iter_mut().find(|i| i.id == own) {
+                *item = Item::new(own, "Rusty Spotlight Settings", launcher_core::Kind::App, vec!["preferences".to_string()]);
+            }
+        }
+        items
+    }
+
+    /// The calculation, conversion or web address the query asks for, if any.
+    fn special_row(&self, query: &str) -> Option<Row> {
+        let s = self.ivars();
+        let config = s.config.borrow();
+        let trimmed = query.trim();
+
+        if let Some((tool, question)) = config::ask_query(&config, trimmed) {
+            return Some(self.ask_row(trimmed, tool, question));
+        }
+
+        // A website keyword comes first (FR-22): `gh rust-lang/rust`.
+        let (keyword, rest) = trimmed.split_once(char::is_whitespace).unwrap_or((trimmed, ""));
+        if let Some(template) = config.links.get(&keyword.to_lowercase()) {
+            if let Some(url) = config::link_url(template, rest) {
+                let shown = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+                return Some(Row {
+                    id: format!("link:{}", keyword.to_lowercase()),
+                    title: if rest.trim().is_empty() { format!("Open {shown}") } else { format!("Open “{}”", rest.trim()) },
+                    subtitle: Some(shown),
+                    kind: Kind::Link { url },
+                });
+            }
+        }
+
+        match calc::parse(trimmed) {
+            Some(calc::Query::Calc(value)) => {
+                let text = calc::format_number(value, None);
+                return Some(Row {
+                    id: "calc".into(),
+                    title: text.clone(),
+                    subtitle: None,
+                    kind: Kind::Value { expression: trimmed.to_string(), copy: text, note: None },
+                });
+            }
+            Some(calc::Query::Convert { amount, from, to }) => {
+                let to = to.unwrap_or_else(|| config.default_currency.clone());
+                // A newer rate arrives as a new presentation, never under the
+                // number already on screen.
+                rates::refresh(&[&from, &to]);
+                let (title, copy, note) = match rates::convert(amount, &from, &to) {
+                    Some((value, at, source)) => {
+                        let text = calc::format_number(value, Some(2));
+                        let unit = rates::convert(1.0, &from, &to).map(|u| u.0).unwrap_or(0.0);
+                        let age = now() - at;
+                        let stale = if age > 3.0 * 86_400.0 { " · out of date" } else { "" };
+                        let note = format!(
+                            "1 {from} = {} {to} · {source} · market rate from {}{stale}",
+                            calc::format_number(unit, Some(if unit >= 10.0 { 2 } else { 4 })),
+                            ago(age)
+                        );
+                        (format!("{text} {to}"), text, note)
+                    }
+                    None => ("Rate unavailable".to_string(), String::new(), "Waiting for the exchange rate".to_string()),
+                };
+                return Some(Row {
+                    id: "convert".into(),
+                    title,
+                    subtitle: None,
+                    kind: Kind::Value {
+                        expression: format!("{} {from} to {to}", calc::format_number(amount, None)),
+                        copy,
+                        note: Some(note),
+                    },
+                });
+            }
+            None => {}
+        }
+
+        if let Some(c) = launcher_core::units::parse(trimmed) {
+            let text = calc::format_number(c.value, Some(sig(c.value)));
+            let text = if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text };
+            return Some(Row {
+                id: "units".into(),
+                title: format!("{text} {}", c.to),
+                subtitle: None,
+                kind: Kind::Value { expression: format!("{} {}", calc::format_number(c.amount, None), c.from), copy: text, note: None },
+            });
+        }
+
+        if let Some(q) = launcher_core::time::parse(trimmed) {
+            if let Some(a) = launcher_core::time::answer(&q, now() as i64, &zone_offset) {
+                return Some(Row {
+                    id: "time".into(),
+                    title: a.title.clone(),
+                    subtitle: None,
+                    kind: Kind::Value { expression: a.expression, copy: a.title, note: Some(a.note) },
+                });
+            }
+        }
+
+        let url = config::bare_url(trimmed)?;
+        let shown = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+        Some(Row { id: "url".into(), title: format!("Open {shown}"), subtitle: None, kind: Kind::Link { url } })
+    }
+
+    /// Rank for the current query and show the result. After this returns,
+    /// `rows` and `selected` describe exactly what is on screen.
+    fn present(&self) {
+        let s = self.ivars();
+        let query = s.query.borrow().clone();
+        let abandoned = s.ask.borrow().as_ref().is_some_and(|run| run.query != query.trim());
+        if abandoned {
+            self.cancel_ask();
+        }
+        let special = if query.trim().is_empty() { None } else { self.special_row(&query) };
+        let mut rows: Vec<Row> = {
+            let items = s.items.borrow();
+            let usage = s.usage.borrow();
+            let running = s.running.borrow();
+            let ranked = s.ranker.borrow_mut().rank(&query, &items, &usage, now(), MAX_ROWS);
+            ranked
+                .iter()
+                .map(|r| {
+                    let item = &items[r.index];
+                    Row {
+                        id: item.id.clone(),
+                        title: item.title.clone(),
+                        subtitle: None,
+                        kind: Kind::App { running: running.contains(&item.id) },
+                    }
+                })
+                .collect()
+        };
+        // An empty query shows only the field, as Spotlight does (Q16), unless
+        // the configuration file is broken: that is said once, up front (FR-50).
+        if query.is_empty() {
+            rows.clear();
+            if let (Some(error), Some(path)) = (s.config_error.borrow().as_ref(), config::path()) {
+                rows.push(Row {
+                    id: "notice:config".into(),
+                    title: "config.toml has an error; using the last good settings".into(),
+                    subtitle: Some(error.lines().next().unwrap_or("").to_string()),
+                    kind: Kind::Notice { path: path.to_string_lossy().into_owned() },
+                });
+            }
+        }
+        // The special row leads unless an app is named exactly (FR-22).
+        if let Some(special) = special {
+            let exact = rows.first().is_some_and(|r| fold(&r.title) == fold(&query));
+            rows.insert(if exact { 1 } else { 0 }, special);
+        }
+        // Keep the list inside the fixed window.
+        let budget = ROW_H * MAX_ROWS as f64;
+        let mut height = 0.0;
+        rows.retain(|r| {
+            height += r.height();
+            height <= budget
+        });
+        *s.rows.borrow_mut() = rows;
+        s.selected.set(0);
+        s.actions.borrow_mut().take(); // a new ranking ends any action list
+        self.show_rows();
+    }
+
+    /// Size the panel for `rows` and draw them.
+    fn show_rows(&self) {
+        let s = self.ivars();
+        let height: f64 = s.rows.borrow().iter().map(Row::height).sum();
+        // No borrow is held past this point: the table calls back into the data source.
+        let animate = s.panel.isVisible() && (height - s.shown_height.get()).abs() > 0.5;
+        self.layout(height, animate);
+        self.reload();
+        self.update_completion();
+    }
+
+    // ------------------------------------------------------------ Command-K
+
+    /// List the selected row's actions in place of the results, or go back.
+    fn toggle_actions(&self) {
+        if self.leave_actions() {
+            return;
+        }
+        let s = self.ivars();
+        let Some(row) = s.rows.borrow().get(s.selected.get()).cloned() else { return };
+        let actions = self.actions_for(&row);
+        if actions.len() < 2 {
+            return; // nothing beyond what Return already does
+        }
+        let rows = s.rows.replace(actions);
+        let selected = s.selected.replace(0);
+        *s.actions.borrow_mut() = Some((rows, selected));
+        self.show_rows();
+    }
+
+    /// Back from the action list to the results. False if it was not shown.
+    fn leave_actions(&self) -> bool {
+        let s = self.ivars();
+        let saved = s.actions.borrow_mut().take();
+        let Some((rows, selected)) = saved else { return false };
+        *s.rows.borrow_mut() = rows;
+        s.selected.set(selected);
+        self.show_rows();
+        true
+    }
+
+    fn actions_for(&self, row: &Row) -> Vec<Row> {
+        let s = self.ivars();
+        let action = |n: usize, title: String, act: Act, symbol: &'static str| Row {
+            id: format!("action:{n}"),
+            title,
+            subtitle: None,
+            kind: Kind::Action { act, symbol },
+        };
+        let primary = match &row.kind {
+            Kind::App { .. } if own_bundle().as_deref() == Some(row.id.as_str()) => "Open Settings".to_string(),
+            Kind::App { running: true } => format!("Switch to {}", row.title),
+            Kind::App { running: false } => format!("Open {}", row.title),
+            Kind::Link { .. } | Kind::Ask { .. } => row.title.clone(),
+            Kind::Value { .. } => format!("Copy {}", row.title),
+            Kind::Answer { .. } => "Copy Answer".to_string(),
+            Kind::Notice { path } => format!("Open {}", path.rsplit('/').next().unwrap_or(path)),
+            Kind::Action { .. } => return Vec::new(),
+        };
+        let mut list = vec![action(0, primary, Act::Primary, "return")];
+        let mut add = |title: String, act: Act, symbol: &'static str| {
+            let n = list.len();
+            list.push(action(n, title, act, symbol));
+        };
+        match &row.kind {
+            Kind::App { running } if own_bundle().as_deref() != Some(row.id.as_str()) => {
+                add("Show in Finder".into(), Act::Reveal(row.id.clone()), "folder");
+                add("Copy Path".into(), Act::Copy(row.id.clone()), "doc.on.doc");
+                if *running {
+                    add(format!("Quit {}", row.title), Act::Quit { path: row.id.clone(), force: false }, "xmark.circle");
+                    add(format!("Force Quit {}", row.title), Act::Quit { path: row.id.clone(), force: true }, "exclamationmark.octagon");
+                }
+            }
+            Kind::Link { url } => add("Copy Link".into(), Act::Copy(url.clone()), "link"),
+            Kind::Value { copy, expression, .. } if !copy.is_empty() => {
+                let joined = format!("{expression}{} {}", if row.id == "time" { ":" } else { " =" }, row.title);
+                add(format!("Copy “{joined}”"), Act::Copy(joined), "doc.on.doc");
+            }
+            Kind::Ask { pending: false, tool, .. } | Kind::Answer { tool, .. } => {
+                let config = s.config.borrow();
+                let query = s.query.borrow();
+                if let Some((_, question)) = config::ask_query(&config, &query) {
+                    for other in config.ask.tools.keys().filter(|t| *t != tool) {
+                        let act = Act::AskWith { tool: other.clone(), question: question.to_string() };
+                        add(format!("Ask {} Instead", display_name(other)), act, "sparkles");
+                    }
+                }
+            }
+            Kind::Notice { path } => add("Show in Finder".into(), Act::Reveal(path.clone()), "folder"),
+            _ => {}
+        }
+        list
+    }
+
+    fn run_action(&self, act: &Act) {
+        let s = self.ivars();
+        match act {
+            Act::Primary => {
+                self.leave_actions();
+                self.activate();
+            }
+            Act::Reveal(path) => {
+                self.dismiss();
+                let urls = objc2_foundation::NSArray::from_retained_slice(&[NSURL::fileURLWithPath(&ns(path))]);
+                NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
+            }
+            Act::Copy(text) => {
+                copy_text(text);
+                self.dismiss();
+            }
+            Act::Quit { path, force } => {
+                self.dismiss();
+                for app in NSWorkspace::sharedWorkspace().runningApplications().iter() {
+                    if app.bundleURL().and_then(|u| u.path()).is_some_and(|p| p.to_string() == *path) {
+                        event_log(&format!("{} {path}", if *force { "force quit" } else { "quit" }));
+                        if *force { app.forceTerminate() } else { app.terminate() };
+                    }
+                }
+            }
+            Act::AskWith { tool, question } => {
+                self.leave_actions();
+                let text = format!("?{tool} {question}");
+                s.field.setStringValue(&ns(&text));
+                if let Some(editor) = s.field.currentEditor() {
+                    editor.setSelectedRange(objc2_foundation::NSRange::new(ns(&text).length(), 0));
+                }
+                *s.query.borrow_mut() = text;
+                self.start_ask(tool, question);
+            }
+        }
+    }
+
+    fn reload(&self) {
+        let s = self.ivars();
+        s.table.reloadData();
+        if !s.rows.borrow().is_empty() {
+            let index = NSIndexSet::indexSetWithIndex(s.selected.get());
+            s.table.selectRowIndexes_byExtendingSelection(&index, false);
+            s.table.scrollRowToVisible(s.selected.get() as NSInteger);
+        }
+    }
+
+    fn move_selection(&self, delta: isize) {
+        let s = self.ivars();
+        let len = s.rows.borrow().len();
+        if len == 0 {
+            return;
+        }
+        let next = (s.selected.get() as isize + delta).clamp(0, len as isize - 1) as usize;
+        if next != s.selected.get() {
+            s.selected.set(next);
+            self.reload();
+            self.update_completion();
+        }
+    }
+
+    /// The selected row's title continues what was typed: show the rest and the action.
+    fn update_completion(&self) {
+        let s = self.ivars();
+        let query = s.query.borrow().clone();
+        let row = s.rows.borrow().get(s.selected.get()).cloned();
+        let text = match row {
+            Some(row) if !query.is_empty() => Some(match &row.kind {
+                Kind::Value { copy, .. } if copy.is_empty() => String::new(),
+                Kind::Value { .. } => format!(" = {}", row.title),
+                Kind::Link { .. } => format!(" — {}", row.title),
+                Kind::Ask { pending: false, .. } => format!(" — {}", row.title),
+                Kind::Ask { .. } | Kind::Answer { .. } | Kind::Notice { .. } | Kind::Action { .. } => String::new(),
+                Kind::App { .. } => match completion(&query, &row.title) {
+                    Some(rest) => format!("{rest} — {}", row.action()),
+                    None => format!(" — {}", row.title),
+                },
+            }),
+            _ => None,
+        }
+        .filter(|t| !t.is_empty());
+        let selected = s.rows.borrow().get(s.selected.get()).cloned();
+        match &selected {
+            Some(row) if !query.is_empty() && matches!(row.kind, Kind::App { .. }) => {
+                s.field_icon.setImage(Some(&self.icon(&row.id)));
+                s.field_icon.setHidden(false);
+            }
+            _ => s.field_icon.setHidden(true),
+        }
+        let Some(text) = text else {
+            s.completion.setHidden(true);
+            return;
+        };
+        s.measure.setStringValue(&ns(&query));
+        s.measure.sizeToFit();
+        let typed_w = s.measure.frame().size.width;
+        s.completion.setStringValue(&ns(&text));
+        s.completion.sizeToFit();
+        let field = s.field.frame();
+        let size = s.completion.frame().size;
+        let x = field.origin.x + typed_w - 2.0;
+        let max_w = (field.origin.x + field.size.width - x).max(0.0);
+        // Same origin and height as the field: both are single-line text cells
+        // in the same font, so their baselines coincide.
+        s.completion.setFrame(NSRect::new(
+            NSPoint::new(x, field.origin.y),
+            NSSize::new(size.width.min(max_w), field.size.height),
+        ));
+        s.completion.setHidden(max_w < 40.0);
+    }
+
+    /// Right arrow or Tab at the end of the text: take the completed title.
+    fn accept_completion(&self, text_view: &NSTextView) -> bool {
+        let s = self.ivars();
+        let query = s.query.borrow().clone();
+        let at_end = {
+            let range = text_view.selectedRange();
+            range.length == 0 && range.location == ns(&query).length()
+        };
+        let row = s.rows.borrow().get(s.selected.get()).cloned();
+        let Some(row) = row else { return false };
+        if !matches!(row.kind, Kind::App { .. }) {
+            return false;
+        }
+        if !at_end || query.is_empty() || fold(&query) == fold(&row.title) {
+            return false;
+        }
+        if completion(&query, &row.title).is_none() {
+            return false;
+        }
+        s.field.setStringValue(&ns(&row.title));
+        if let Some(editor) = s.field.currentEditor() {
+            let end = ns(&row.title).length();
+            editor.setSelectedRange(objc2_foundation::NSRange::new(end, 0));
+        }
+        *s.query.borrow_mut() = row.title.clone();
+        self.present();
+        true
+    }
+
+    // ------------------------------------------------------------ action
+
+    /// Return or click: run the presented, selected row (FR-14, FR-20a).
+    fn activate(&self) {
+        let s = self.ivars();
+        let row = s.rows.borrow().get(s.selected.get()).cloned();
+        let Some(row) = row else { return };
+        let query = fold(&s.query.borrow());
+
+        match &row.kind {
+            Kind::App { .. } if own_bundle().as_deref() == Some(row.id.as_str()) => {
+                self.dismiss();
+                crate::settings::show(self);
+            }
+            Kind::App { .. } => {
+                // Hide first, then ask the system to open; never wait for the app.
+                self.dismiss();
+                let url = NSURL::fileURLWithPath(&ns(&row.id));
+                let config = NSWorkspaceOpenConfiguration::configuration();
+                NSWorkspace::sharedWorkspace()
+                    .openApplicationAtURL_configuration_completionHandler(&url, &config, None);
+                LAUNCH_GRACE.set(Some(std::time::Instant::now() + std::time::Duration::from_secs(4)));
+            }
+            Kind::Link { url } => {
+                self.dismiss();
+                if let Some(url) = NSURL::URLWithString(&ns(url)) {
+                    NSWorkspace::sharedWorkspace().openURL(&url);
+                }
+                return; // a typed address is not something to learn a ranking from
+            }
+            Kind::Notice { path } => {
+                self.dismiss();
+                NSWorkspace::sharedWorkspace().openURL(&NSURL::fileURLWithPath(&ns(path)));
+                return;
+            }
+            Kind::Action { act, .. } => {
+                self.run_action(act);
+                return;
+            }
+            Kind::Ask { pending: true, .. } => return, // already asked; a second Return does nothing
+            Kind::Ask { tool, question, .. } => {
+                self.start_ask(tool, question);
+                return;
+            }
+            Kind::Answer { text, .. } => {
+                copy_text(text);
+                self.dismiss();
+                return;
+            }
+            Kind::Value { copy, .. } => {
+                if copy.is_empty() {
+                    return; // no rate yet: nothing was shown, so nothing is copied
+                }
+                copy_text(copy);
+                self.dismiss();
+                return;
+            }
+        }
+
+        let mut usage = s.usage.borrow_mut();
+        usage.record(&query, &row.id, now());
+        if let Err(e) = store::save(&usage) {
+            eprintln!("[rs] could not save usage: {e}");
+        }
+    }
+
+    // ------------------------------------------------------------ cells
+
+    fn icon(&self, path: &str) -> Retained<NSImage> {
+        if let Some(icon) = self.ivars().icons.borrow().get(path) {
+            return icon.clone();
+        }
+        let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns(path));
+        self.ivars().icons.borrow_mut().insert(path.to_string(), icon.clone());
+        icon
+    }
+
+    // ------------------------------------------------------------ ask
+
+    fn ask_row(&self, query: &str, tool: &str, question: &str) -> Row {
+        let name = display_name(tool);
+        let run = self.ivars().ask.borrow();
+        let run = run.as_ref().filter(|run| run.query == query);
+        let (title, subtitle, kind) = match run.map(|r| (&r.outcome, r.request.is_some())) {
+            Some((Some(Ok(text)), _)) => {
+                let (height, truncated) = self.answer_height(text);
+                return Row {
+                    id: "answer".into(),
+                    title: text.lines().next().unwrap_or("").to_string(),
+                    subtitle: None,
+                    kind: Kind::Answer { tool: name, text: text.clone(), height, truncated },
+                };
+            }
+            Some((Some(Err(error)), _)) => (
+                format!("{name} could not answer"),
+                error.clone(),
+                Kind::Ask { tool: tool.to_string(), question: question.to_string(), pending: false },
+            ),
+            Some((None, true)) => (
+                format!("Asking {name}…"),
+                question.to_string(),
+                Kind::Ask { tool: tool.to_string(), question: question.to_string(), pending: true },
+            ),
+            _ => (
+                format!("Ask {name}"),
+                question.to_string(),
+                Kind::Ask { tool: tool.to_string(), question: question.to_string(), pending: false },
+            ),
+        };
+        Row { id: format!("ask:{tool}"), title, subtitle: Some(subtitle), kind }
+    }
+
+    fn start_ask(&self, tool: &str, question: &str) {
+        let s = self.ivars();
+        let query = s.query.borrow().trim().to_string();
+        let command = s.config.borrow().ask.tools.get(tool).cloned().unwrap_or_default();
+        self.cancel_ask();
+        let run = match ask::start(&command, question) {
+            Ok(request) => AskRun { query, request: Some(request), outcome: None },
+            Err(error) => AskRun { query, request: None, outcome: Some(Err(error)) },
+        };
+        let pending = run.request.is_some();
+        *s.ask.borrow_mut() = Some(run);
+        if pending {
+            let timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.1,
+                    self,
+                    sel!(askTick:),
+                    None,
+                    true,
+                )
+            };
+            *s.ask_timer.borrow_mut() = Some(timer);
+        }
+        self.present();
+    }
+
+    fn poll_ask(&self) {
+        let s = self.ivars();
+        let finished = {
+            let mut run = s.ask.borrow_mut();
+            let Some(run) = run.as_mut() else { return };
+            let Some(request) = run.request.as_ref() else { return };
+            let outcome = request.poll().or_else(|| {
+                (request.started.elapsed() > ask::DEADLINE).then(|| Err("no answer in time".to_string()))
+            });
+            match outcome {
+                Some(outcome) => {
+                    run.request = None; // dropping the request stops the tool if it is still running
+                    run.outcome = Some(outcome);
+                    true
+                }
+                None => false,
+            }
+        };
+        if finished {
+            if let Some(timer) = s.ask_timer.borrow_mut().take() {
+                timer.invalidate();
+            }
+            if s.panel.isVisible() {
+                self.present();
+            }
+        }
+    }
+
+    fn cancel_ask(&self) {
+        let s = self.ivars();
+        if let Some(timer) = s.ask_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+        s.ask.borrow_mut().take(); // dropping a pending request kills the tool
+    }
+
+    const ANSWER_WIDTH: f64 = PANEL_W - 36.0 - 34.0;
+
+    fn answer_label(&self, text: &str) -> Retained<NSTextField> {
+        let label = NSTextField::wrappingLabelWithString(&ns(text), self.mtm());
+        label.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+        label.setTextColor(Some(&strong_label(self.mtm())));
+        label.setSelectable(false);
+        label
+    }
+
+    /// Row height for an answer: its text, a heading line and padding, kept
+    /// inside the panel. Longer answers are cut off on screen but copied whole.
+    fn answer_height(&self, text: &str) -> (f64, bool) {
+        let label = self.answer_label(text);
+        let size = label
+            .cell()
+            .map(|c| c.cellSizeForBounds(NSRect::new(NSPoint::ZERO, NSSize::new(Self::ANSWER_WIDTH, 10_000.0))))
+            .unwrap_or(NSSize::new(0.0, 20.0));
+        let (wanted, limit) = (size.height + 54.0, ROW_H * MAX_ROWS as f64);
+        (wanted.clamp(72.0, limit), wanted > limit)
+    }
+
+    fn answer_card(&self, row: &Row, tool: &str, text: &str, truncated: bool) -> Retained<NSView> {
+        let mtm = self.mtm();
+        const CELL_INSET: f64 = 5.5;
+        let h = row.height();
+        let cell = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::ZERO, NSSize::new(PANEL_W, h)));
+        let frame = NSRect::new(NSPoint::new(18.0 - CELL_INSET, 4.0), NSSize::new(PANEL_W - 36.0, h - 8.0));
+        let card = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+        card.setBoxType(NSBoxType::Custom);
+        card.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
+        card.setCornerRadius(20.0);
+        card.setBorderWidth(1.0);
+        card.setBorderColor(&NSColor::labelColor().colorWithAlphaComponent(0.2));
+        card.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(0.12));
+        cell.addSubview(&card);
+
+        let top = frame.origin.y + frame.size.height;
+        let note = if truncated {
+            "too long to show in full · return copies all of it"
+        } else {
+            "return copies the answer"
+        };
+        let heading = NSTextField::labelWithString(&ns(&format!("{tool} · {note}")), mtm);
+        heading.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        heading.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        heading.setFrame(NSRect::new(NSPoint::new(frame.origin.x + 17.0, top - 26.0), NSSize::new(Self::ANSWER_WIDTH, 15.0)));
+        cell.addSubview(&heading);
+
+        let body = self.answer_label(text);
+        let body_h = h - 8.0 - 46.0;
+        if truncated {
+            body.setMaximumNumberOfLines((body_h / 17.0).floor() as isize);
+            body.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+        }
+        body.setFrame(NSRect::new(
+            NSPoint::new(frame.origin.x + 17.0, frame.origin.y + 12.0),
+            NSSize::new(Self::ANSWER_WIDTH, body_h),
+        ));
+        cell.addSubview(&body);
+        cell
+    }
+
+    /// Spotlight's result card (DS-6): the expression small, the result under
+    /// it, a copy hint at the right, and for a conversion the rate and source.
+    fn card(&self, row: &Row, expression: &str, note: Option<&str>) -> Retained<NSView> {
+        let mtm = self.mtm();
+        const CELL_INSET: f64 = 5.5;
+        let h = row.height();
+        let cell = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::ZERO, NSSize::new(PANEL_W, h)));
+
+        let frame = NSRect::new(NSPoint::new(18.0 - CELL_INSET, 4.0), NSSize::new(PANEL_W - 36.0, h - 8.0));
+        let card = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+        card.setBoxType(NSBoxType::Custom);
+        card.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
+        card.setCornerRadius(20.0);
+        card.setBorderWidth(1.0);
+        card.setBorderColor(&NSColor::labelColor().colorWithAlphaComponent(0.2));
+        card.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(0.12));
+        card.setContentViewMargins(NSSize::new(0.0, 0.0));
+        cell.addSubview(&card);
+
+        let width = frame.size.width - 34.0 - 70.0;
+        let top = frame.origin.y + frame.size.height;
+        let label = |text: &str, size: f64, color: &NSColor, y: f64, height: f64| {
+            let l = NSTextField::labelWithString(&ns(text), mtm);
+            l.setFont(Some(&NSFont::systemFontOfSize(size)));
+            l.setTextColor(Some(color));
+            l.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+            l.setFrame(NSRect::new(NSPoint::new(frame.origin.x + 17.0, y), NSSize::new(width, height)));
+            cell.addSubview(&l);
+        };
+        // A time reads as a place or a conversion, not a sum.
+        let head = if row.id == "time" { expression.to_string() } else { format!("{expression} =") };
+        label(&head, 13.0, &NSColor::secondaryLabelColor(), top - 30.0, 18.0);
+        label(&row.title, 17.0, &strong_label(mtm), top - 54.0, 22.0);
+        if let Some(note) = note {
+            label(note, 11.0, &NSColor::secondaryLabelColor(), frame.origin.y + 9.0, 15.0);
+        }
+
+        let key = NSTextField::labelWithString(&ns("return"), mtm);
+        key.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        key.setTextColor(Some(&NSColor::labelColor()));
+        key.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+        key.setDrawsBackground(true);
+        key.setBackgroundColor(Some(&NSColor::labelColor().colorWithAlphaComponent(0.2)));
+        key.setWantsLayer(true);
+        unsafe {
+            let layer: Option<Retained<AnyObject>> = msg_send![&*key, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![&*layer, setCornerRadius: 5.0f64];
+                let _: () = msg_send![&*layer, setMasksToBounds: true];
+            }
+        }
+        key.sizeToFit();
+        let size = NSSize::new(key.frame().size.width + 8.0, 18.0);
+        let x = frame.origin.x + frame.size.width - 14.0 - size.width;
+        key.setFrame(NSRect::new(NSPoint::new(x, top - 38.0), size));
+        cell.addSubview(&key);
+
+        let hint = NSTextField::labelWithString(&ns("Copy"), mtm);
+        hint.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        hint.sizeToFit();
+        let hint_size = hint.frame().size;
+        hint.setFrame(NSRect::new(NSPoint::new(x - 8.0 - hint_size.width, top - 36.0), hint_size));
+        cell.addSubview(&hint);
+        cell
+    }
+
+    fn cell(&self, row: &Row, selected: bool) -> Retained<NSView> {
+        if let Kind::Value { expression, note, .. } = &row.kind {
+            return self.card(row, expression, note.as_deref());
+        }
+        if let Kind::Answer { tool, text, truncated, .. } = &row.kind {
+            return self.answer_card(row, tool, text, *truncated);
+        }
+        let mtm = self.mtm();
+        let cell = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_W, ROW_H)),
+        );
+
+        // The table insets its cells by CELL_INSET; positions below are from
+        // the panel's edge as measured on Spotlight, so that inset is taken off.
+        const CELL_INSET: f64 = 5.5;
+        // App icon artwork fills about 80% of its canvas: a 44 pt view shows a 36 pt icon.
+        let image = match &row.kind {
+            Kind::App { .. } => NSImageView::imageViewWithImage(&self.icon(&row.id), mtm),
+            kind => {
+                let view = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
+                let symbol = match kind {
+                    Kind::Action { symbol, .. } => symbol,
+                    Kind::Ask { .. } => "sparkles",
+                    Kind::Notice { .. } => "exclamationmark.triangle",
+                    _ => "globe",
+                };
+                let globe = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns(symbol), None).and_then(|g| {
+                    g.imageWithSymbolConfiguration(
+                        &objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(24.0, unsafe {
+                            NSFontWeightMedium
+                        }),
+                    )
+                });
+                view.setImage(globe.as_deref());
+                view.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+                view
+            }
+        };
+        let app = matches!(row.kind, Kind::App { .. });
+        image.setImageScaling(if app { NSImageScaling::ScaleProportionallyUpOrDown } else { NSImageScaling::ScaleNone });
+        image.setFrame(NSRect::new(NSPoint::new(13.0 - CELL_INSET, 6.0), NSSize::new(44.0, 44.0)));
+        cell.addSubview(&image);
+
+        // Trailing: the action and its key on the selected row; a dot for a running app.
+        let mut trailing = PANEL_W - 17.0 - CELL_INSET;
+        if selected && !row.action().is_empty() {
+            let key = NSTextField::labelWithString(&ns("return"), mtm);
+            key.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            key.setTextColor(Some(&NSColor::labelColor()));
+            key.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+            key.setDrawsBackground(true);
+            key.setBackgroundColor(Some(&NSColor::labelColor().colorWithAlphaComponent(0.2)));
+            key.setWantsLayer(true);
+            unsafe {
+                let layer: Option<Retained<AnyObject>> = msg_send![&*key, layer];
+                if let Some(layer) = layer {
+                    let _: () = msg_send![&*layer, setCornerRadius: 5.0f64];
+                    let _: () = msg_send![&*layer, setMasksToBounds: true];
+                }
+            }
+            key.sizeToFit();
+            let size = NSSize::new(key.frame().size.width + 8.0, 18.0);
+            trailing -= size.width;
+            key.setFrame(NSRect::new(NSPoint::new(trailing, (ROW_H - size.height) / 2.0), size));
+            cell.addSubview(&key);
+            trailing -= 8.0;
+
+            let hint = NSTextField::labelWithString(&ns(row.action()), mtm);
+            hint.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            hint.sizeToFit();
+            let size = hint.frame().size;
+            trailing -= size.width;
+            hint.setFrame(NSRect::new(NSPoint::new(trailing, (ROW_H - size.height) / 2.0), size));
+            cell.addSubview(&hint);
+            trailing -= 10.0;
+        }
+        if matches!(row.kind, Kind::App { running: true }) {
+            let dot = NSTextField::labelWithString(&ns("•"), mtm);
+            dot.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            dot.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+            dot.sizeToFit();
+            let size = dot.frame().size;
+            trailing -= size.width;
+            dot.setFrame(NSRect::new(NSPoint::new(trailing, (ROW_H - size.height) / 2.0), size));
+            cell.addSubview(&dot);
+            trailing -= 10.0;
+        }
+
+        let title = NSTextField::labelWithString(&ns(&row.title), mtm);
+        title.setFont(Some(&NSFont::systemFontOfSize(17.0)));
+        title.setTextColor(Some(&strong_label(mtm)));
+        title.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+        let title_x = 68.5 - CELL_INSET;
+        let title_y = if row.subtitle.is_some() { 27.0 } else { 17.0 };
+        title.setFrame(NSRect::new(NSPoint::new(title_x, title_y), NSSize::new(trailing - title_x, 22.0)));
+        if let Some(subtitle) = &row.subtitle {
+            let sub = NSTextField::labelWithString(&ns(subtitle), mtm);
+            sub.setFont(Some(&NSFont::systemFontOfSize(15.0)));
+            sub.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            sub.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+            sub.setFrame(NSRect::new(NSPoint::new(title_x, 7.0), NSSize::new(trailing - title_x, 20.0)));
+            cell.addSubview(&sub);
+        }
+        cell.addSubview(&title);
+        cell
+    }
+}
+
+fn copy_text(text: &str) {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    pasteboard.setString_forType(&ns(text), unsafe { NSPasteboardTypeString });
+}
+
+/// Decimal places for a converted amount: about four significant digits,
+/// and none from 1000 up.
+fn sig(value: f64) -> usize {
+    let magnitude = if value == 0.0 { 0 } else { value.abs().log10().floor() as i32 };
+    (3 - magnitude).clamp(0, 6) as usize
+}
+
+/// A zone's offset from UTC, in seconds, at `t` seconds since 1970. `local`
+/// is this Mac's zone. Comes from the system's time zone database.
+fn zone_offset(id: &str, t: i64) -> Option<i32> {
+    let zone = if id == "local" { NSTimeZone::localTimeZone() } else { NSTimeZone::timeZoneWithName(&ns(id))? };
+    let date = NSDate::dateWithTimeIntervalSince1970(t as f64);
+    Some(zone.secondsFromGMTForDate(&date) as i32)
+}
+
+/// This app's bundle, when it runs from one.
+fn own_bundle() -> Option<String> {
+    let path = objc2_foundation::NSBundle::mainBundle().bundlePath().to_string();
+    path.ends_with(".app").then_some(path)
+}
+
+/// `claude` → `Claude`.
+fn display_name(tool: &str) -> String {
+    let mut chars = tool.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// "just now", "12 min ago", "3 h ago", "2 d ago".
+fn ago(seconds: f64) -> String {
+    let s = seconds.max(0.0);
+    if s < 90.0 {
+        "just now".into()
+    } else if s < 3600.0 {
+        format!("{:.0} min ago", s / 60.0)
+    } else if s < 86_400.0 {
+        format!("{:.0} h ago", s / 3600.0)
+    } else {
+        format!("{:.0} d ago", s / 86_400.0)
+    }
+}
+
+/// Spotlight draws titles and typed text at full strength, where the system
+/// label colour is slightly translucent. Follows the current appearance.
+fn strong_label(mtm: MainThreadMarker) -> Retained<NSColor> {
+    let dark = objc2_app_kit::NSApplication::sharedApplication(mtm)
+        .effectiveAppearance()
+        .name()
+        .to_string()
+        .contains("Dark");
+    if dark { NSColor::whiteColor() } else { NSColor::blackColor() }
+}
+
+fn running_bundle_paths() -> HashSet<String> {
+    let mut set = HashSet::new();
+    for app in NSWorkspace::sharedWorkspace().runningApplications().iter() {
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue; // helpers and agents are not apps the user switches to
+        }
+        if let Some(path) = app.bundleURL().and_then(|u| u.path()) {
+            set.insert(path.to_string());
+        }
+    }
+    set
+}
+
+// ---------------------------------------------------------------- shadow
+
+// The shadow is drawn by a layer behind the glass. Left alone it would also
+// darken the glass from underneath, so a mask removes everything inside the
+// panel's outline and only the part that spills outside remains.
+
+type CGPath = *mut std::ffi::c_void;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGPathCreateWithRoundedRect(rect: NSRect, cw: f64, ch: f64, transform: *const std::ffi::c_void) -> CGPath;
+    fn CGPathCreateMutable() -> CGPath;
+    fn CGPathAddRect(path: CGPath, transform: *const std::ffi::c_void, rect: NSRect);
+    fn CGPathAddRoundedRect(path: CGPath, transform: *const std::ffi::c_void, rect: NSRect, cw: f64, ch: f64);
+    fn CGPathRelease(path: CGPath);
+}
+
+/// How far outside the panel the shadow is allowed to reach.
+const SHADOW_REACH: f64 = 90.0;
+
+type PathSetter = unsafe extern "C-unwind" fn(&AnyObject, Sel, CGPath);
+
+fn send_path(target: &AnyObject, selector: Sel, path: CGPath) {
+    // CGPathRef arguments are sent directly: msg_send! has no type for them.
+    unsafe {
+        let send: PathSetter = std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn());
+        send(target, selector, path);
+    }
+}
+
+/// The panel's outline, `dy` above the layer's origin.
+fn outline(w: f64, h: f64, dy: f64) -> CGPath {
+    let r = RADIUS.min(h / 2.0);
+    unsafe {
+        CGPathCreateWithRoundedRect(NSRect::new(NSPoint::new(0.0, dy), NSSize::new(w, h)), r, r, std::ptr::null())
+    }
+}
+
+/// Everything within SHADOW_REACH of the outline except the outline's interior
+/// (used with the even-odd fill rule).
+fn ring(w: f64, h: f64, dy: f64) -> CGPath {
+    let r = RADIUS.min(h / 2.0);
+    unsafe {
+        let path = CGPathCreateMutable();
+        CGPathAddRect(
+            path,
+            std::ptr::null(),
+            NSRect::new(
+                NSPoint::new(-SHADOW_REACH, dy - SHADOW_REACH),
+                NSSize::new(w + 2.0 * SHADOW_REACH, h + 2.0 * SHADOW_REACH),
+            ),
+        );
+        CGPathAddRoundedRect(path, std::ptr::null(), NSRect::new(NSPoint::new(0.0, dy), NSSize::new(w, h)), r, r);
+        path
+    }
+}
+
+fn shadow_layers(view: &NSView) -> Option<(Retained<AnyObject>, Retained<AnyObject>)> {
+    let layer: Option<Retained<AnyObject>> = unsafe { msg_send![view, layer] };
+    let layer = layer?;
+    let mask: Option<Retained<AnyObject>> = unsafe { msg_send![&*layer, mask] };
+    let mask = match mask {
+        Some(mask) => mask,
+        None => {
+            let class = AnyClass::get(c"CAShapeLayer")?;
+            let mask: Retained<AnyObject> = unsafe { msg_send![class, layer] };
+            unsafe {
+                let _: () = msg_send![&*mask, setFillRule: &*ns("even-odd")];
+                let _: () = msg_send![&*layer, setMask: &*mask];
+            }
+            mask
+        }
+    };
+    Some((layer, mask))
+}
+
+/// Size the shadow and its mask for a `w` × `h` panel.
+fn update_shadow(view: &NSView, w: f64, h: f64) {
+    let Some((layer, mask)) = shadow_layers(view) else { return };
+    let (shape, hole) = (outline(w, h, 0.0), ring(w, h, 0.0));
+    // Set without implicit animation: the caller steps the size every frame.
+    if let Some(class) = AnyClass::get(c"CATransaction") {
+        unsafe {
+            let _: () = msg_send![class, begin];
+            let _: () = msg_send![class, setDisableActions: true];
+        }
+        send_path(&layer, sel!(setShadowPath:), shape);
+        send_path(&mask, sel!(setPath:), hole);
+        unsafe {
+            let _: () = msg_send![class, commit];
+        }
+    }
+    unsafe {
+        CGPathRelease(shape);
+        CGPathRelease(hole);
+    }
+}
+
+// ---------------------------------------------------------------- spring
+
+// Spotlight's resize spring, fitted to a 60 fps recording on macOS 27.2 of
+// its field retracting to make room for its buttons: 499 px of travel, target
+// first reached after about 165 ms, 8.6% overshoot at about 240 ms, a small
+// rebound past the target at about 475 ms, at rest by about 650 ms.
+// That is a damping ratio of about 0.62 at about 17 rad/s.
+const SPRING_DAMPING_RATIO: f64 = 0.62;
+const SPRING_FREQUENCY: f64 = 17.0;
+const SPRING_SETTLE: f64 = 0.75;
+
+/// Position of that spring at time `t`, from 0 towards 1, overshooting.
+fn spring_progress(t: f64) -> f64 {
+    let (z, w) = (SPRING_DAMPING_RATIO, SPRING_FREQUENCY);
+    let wd = w * (1.0 - z * z).sqrt();
+    1.0 - (-z * w * t).exp() * ((wd * t).cos() + (z * w / wd) * (wd * t).sin())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zone_offset;
+
+    #[test]
+    fn every_zone_is_in_the_system_database() {
+        for zone in launcher_core::time::zones() {
+            assert!(zone_offset(zone.id, 0).is_some(), "{}", zone.id);
+        }
+        assert_eq!(zone_offset("Asia/Kathmandu", 1_795_321_800), Some(20_700));
+        // Sydney: summer time in January, not in July (2026).
+        assert_eq!(zone_offset("Australia/Sydney", 1_768_000_000), Some(39_600));
+        assert_eq!(zone_offset("Australia/Sydney", 1_783_000_000), Some(36_000));
+    }
+}

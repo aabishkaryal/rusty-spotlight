@@ -1,0 +1,279 @@
+//! User configuration (FR-50): one TOML file, read at start and on each summon
+//! when it has changed. A malformed edit keeps the last good configuration.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+use serde::Deserialize;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Modifiers and Space, e.g. `cmd+space` or `option+space`. Read at start.
+    pub hotkey: String,
+    /// Target when a conversion names only one currency (`100 usd`).
+    pub default_currency: String,
+    /// Show the magnifying glass in the menu bar. Settings stay reachable from
+    /// the launcher ("settings") and by opening the app again in Finder.
+    pub menu_bar_icon: bool,
+    /// `alias = "App name"`: typing the alias ranks that app first.
+    pub aliases: BTreeMap<String, String>,
+    /// `keyword = "https://…{query}…"`: typing `keyword words` opens the URL.
+    pub links: BTreeMap<String, String>,
+    pub ask: Ask,
+}
+
+/// Assistant command-line tools for `? question` (FR-34).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Ask {
+    /// Used for a bare `? question`. `?name question` picks another.
+    pub default: String,
+    /// name = [program, args…]; `{question}` marks where the question goes.
+    pub tools: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for Ask {
+    fn default() -> Self {
+        let tool = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let mut tools = BTreeMap::new();
+        tools.insert("claude".into(), tool(&["~/.local/bin/claude", "-p", "{question}", "--model", "haiku"]));
+        tools.insert(
+            "codex".into(),
+            tool(&["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "{question}"]),
+        );
+        tools.insert("grok".into(), tool(&["grok", "-p", "{question}", "--no-subagents"]));
+        Self { default: "claude".into(), tools }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { hotkey: "option+space".into(), default_currency: "INR".into(), menu_bar_icon: true, aliases: BTreeMap::new(), links: BTreeMap::new(), ask: Ask::default() }
+    }
+}
+
+const TEMPLATE: &str = r#"# rusty-spotlight configuration. Saved changes apply the next time the panel opens.
+
+# The shortcut that opens the panel: modifiers and space, e.g. "cmd+space" or
+# "option+space". Takes effect when the launcher restarts. For "cmd+space", first
+# turn off Spotlight's own shortcut in System Settings > Keyboard > Keyboard
+# Shortcuts > Spotlight.
+hotkey = "option+space"
+
+# Used when a conversion names only one currency, e.g. "100 usd".
+default_currency = "INR"
+
+# Show the icon in the menu bar. When it is hidden, type "settings" in the
+# launcher, or open Rusty Spotlight again in Finder, to reach the settings.
+menu_bar_icon = true
+
+# alias = "App name": typing the alias puts that app first.
+[aliases]
+# ff = "Firefox"
+
+# keyword = "URL". "{query}" is replaced by whatever follows the keyword.
+[links]
+g = "https://www.google.com/search?q={query}"
+yt = "https://www.youtube.com/results?search_query={query}"
+gh = "https://github.com/{query}"
+
+# "? question" asks an assistant tool installed on this Mac and shows its answer.
+# "?codex question" or "?grok question" picks another one. The question is sent
+# to that tool's service; nothing it answers is ever run.
+[ask]
+default = "claude"
+
+[ask.tools]
+claude = ["~/.local/bin/claude", "-p", "{question}", "--model", "haiku"]
+codex = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "{question}"]
+grok = ["grok", "-p", "{question}", "--no-subagents"]
+"#;
+
+pub fn path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/rusty-spotlight/config.toml"))
+}
+
+pub struct Loaded {
+    pub config: Config,
+    pub modified: Option<SystemTime>,
+    /// Set when the file could not be parsed; `config` is then the previous one.
+    pub error: Option<String>,
+}
+
+fn modified() -> Option<SystemTime> {
+    std::fs::metadata(path()?).ok()?.modified().ok()
+}
+
+/// Read the file, creating it with examples on first run.
+pub fn load(previous: Option<&Config>) -> Loaded {
+    let fallback = previous.cloned().unwrap_or_default();
+    let Some(path) = path() else {
+        return Loaded { config: fallback, modified: None, error: None };
+    };
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, TEMPLATE);
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => return Loaded { config: fallback, modified: modified(), error: Some(e.to_string()) },
+    };
+    match toml::from_str::<Config>(&text) {
+        Ok(mut config) => {
+            config.default_currency = config.default_currency.to_uppercase();
+            Loaded { config, modified: modified(), error: None }
+        }
+        Err(e) => Loaded { config: fallback, modified: modified(), error: Some(e.message().to_string()) },
+    }
+}
+
+/// Set one top-level `key = value` line, keeping every other line and comment.
+/// `value` is written as given, so strings must carry their own quotes.
+pub fn set_value(key: &str, value: &str) -> std::io::Result<()> {
+    let path = path().ok_or_else(|| std::io::Error::other("no home folder"))?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| TEMPLATE.to_string());
+    std::fs::write(&path, with_value(&text, key, value))
+}
+
+fn with_value(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = {value}");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // Only the top level, before the first [table], holds plain keys.
+    let top = lines.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(lines.len());
+    let existing = lines[..top].iter().position(|l| {
+        l.split_once('=').is_some_and(|(k, _)| k.trim() == key)
+    });
+    match existing {
+        Some(i) => lines[i] = line,
+        None => {
+            // After the last top-level line, set off by blank lines.
+            let at = lines[..top].iter().rposition(|l| !l.trim().is_empty()).map_or(0, |i| i + 1);
+            lines.insert(at, line);
+            if lines.get(at + 1).is_some_and(|l| !l.trim().is_empty()) {
+                lines.insert(at + 1, String::new());
+            }
+            if at > 0 && !lines[at - 1].trim().is_empty() {
+                lines.insert(at, String::new());
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Whether the file changed since `since`.
+pub fn changed_since(since: Option<SystemTime>) -> bool {
+    modified() != since
+}
+
+/// Build the URL for a link keyword. Only http and https are ever opened (NFR-34).
+pub fn link_url(template: &str, query: &str) -> Option<String> {
+    let mut encoded = String::new();
+    for b in query.trim().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => encoded.push(b as char),
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{b:02X}")),
+        }
+    }
+    let url = template.replace("{query}", &encoded);
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
+/// A typed address such as `github.com/rust-lang` or `https://example.org`.
+pub fn bare_url(query: &str) -> Option<String> {
+    let q = query.trim();
+    if q.contains(char::is_whitespace) || q.is_empty() {
+        return None;
+    }
+    if q.starts_with("https://") || q.starts_with("http://") {
+        return (q.len() > 10).then(|| q.to_string());
+    }
+    let host = q.split('/').next()?;
+    let (name, tld) = host.rsplit_once('.')?;
+    let ok = !name.is_empty()
+        && (2..=24).contains(&tld.len())
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    ok.then(|| format!("https://{q}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_value_keeps_the_rest_of_the_file() {
+        let text = "# note\nhotkey = \"cmd+space\"\n\n[links]\ng = \"x\"\n";
+        let added = with_value(text, "menu_bar_icon", "false");
+        assert_eq!(added, "# note\nhotkey = \"cmd+space\"\n\nmenu_bar_icon = false\n\n[links]\ng = \"x\"\n");
+        let changed = with_value(&added, "menu_bar_icon", "true");
+        assert_eq!(changed, added.replace("menu_bar_icon = false", "menu_bar_icon = true"));
+        // A key of the same name inside a table is not the top-level one.
+        let in_table = "[links]\nmenu_bar_icon = \"x\"\n";
+        assert_eq!(with_value(in_table, "menu_bar_icon", "false"), "menu_bar_icon = false\n\n[links]\nmenu_bar_icon = \"x\"\n");
+        assert!(toml::from_str::<Config>(&with_value(in_table, "menu_bar_icon", "false")).is_ok_and(|c| !c.menu_bar_icon));
+        assert!(toml::from_str::<Config>(&with_value(TEMPLATE, "menu_bar_icon", "false")).is_ok_and(|c| !c.menu_bar_icon));
+    }
+
+    #[test]
+    fn links_encode_the_query() {
+        assert_eq!(link_url("https://github.com/{query}", "rust-lang/rust").as_deref(), Some("https://github.com/rust-lang/rust"));
+        assert_eq!(link_url("https://x.test/?q={query}", "a b&c").as_deref(), Some("https://x.test/?q=a%20b%26c"));
+        assert_eq!(link_url("file:///etc/{query}", "passwd"), None);
+    }
+
+    #[test]
+    fn bare_urls() {
+        assert_eq!(bare_url("github.com/rust-lang").as_deref(), Some("https://github.com/rust-lang"));
+        assert_eq!(bare_url("https://example.org/a").as_deref(), Some("https://example.org/a"));
+        for s in ["terminal", "2.0", "1.2.3", "a b.com", "notes.", ".com"] {
+            assert_eq!(bare_url(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn ask_queries() {
+        let c = Config::default();
+        assert_eq!(ask_query(&c, "? list big files"), Some(("claude", "list big files")));
+        assert_eq!(ask_query(&c, "?grok list big files"), Some(("grok", "list big files")));
+        assert_eq!(ask_query(&c, "?Codex why"), Some(("codex", "why")));
+        assert_eq!(ask_query(&c, "?how do I untar"), Some(("claude", "how do I untar")));
+        assert_eq!(ask_query(&c, "?"), None);
+        assert_eq!(ask_query(&c, "?grok"), None);
+        assert_eq!(ask_query(&c, "terminal"), None);
+    }
+
+    #[test]
+    fn template_parses() {
+        let c: Config = toml::from_str(TEMPLATE).unwrap();
+        assert_eq!(c.default_currency, "INR");
+        assert!(c.links.contains_key("gh"));
+        assert_eq!(c.ask.default, "claude");
+        assert_eq!(c.ask.tools.len(), 3);
+    }
+}
+
+/// `? question` or `?name question` → (tool name, question).
+pub fn ask_query<'a>(config: &'a Config, query: &'a str) -> Option<(&'a str, &'a str)> {
+    let rest = query.trim_start().strip_prefix('?')?;
+    let (head, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if head.is_empty() {
+        let question = tail.trim();
+        return (!question.is_empty()).then_some((config.ask.default.as_str(), question));
+    }
+    match config.ask.tools.get_key_value(&head.to_lowercase()) {
+        Some((name, _)) => {
+            let question = tail.trim();
+            (!question.is_empty()).then_some((name.as_str(), question))
+        }
+        // `?how do I…` with no space after the mark: the default tool.
+        None => Some((config.ask.default.as_str(), rest.trim())),
+    }
+}

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Launcher panel mockup</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; -webkit-font-smoothing: antialiased; }
+  p.note { font-size: 13px; color: var(--muted-foreground, #8e8e93); margin-bottom: 16px; line-height: 1.45; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  .stage { border-radius: 14px; padding: 18px 16px 30px; display: flex; flex-direction: column; align-items: center; overflow: hidden; }
+  .stage.dark  { background: linear-gradient(135deg, #10202b 0%, #2a2140 55%, #47283a 100%); }
+  .stage.light { background: linear-gradient(135deg, #8ec5fc 0%, #e0c3fc 55%, #fbc2a4 100%); }
+  .caption { align-self: flex-start; font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; margin-bottom: 16px; background: rgba(0,0,0,.4); color: #fff; }
+
+  /* Sizes below are in points, measured from Spotlight on macOS 27.2 (see REQUIREMENTS 5.5). */
+  .panel { width: 100%; max-width: 640px; border-radius: 28px; overflow: hidden;
+           backdrop-filter: blur(36px) saturate(170%); -webkit-backdrop-filter: blur(36px) saturate(170%); }
+  .dark .panel {
+    --label: rgba(255,255,255,.95); --secondary: rgba(255,255,255,.5); --tertiary: rgba(255,255,255,.32);
+    --sep: rgba(255,255,255,.13); --fill: rgba(255,255,255,.13); --fill2: rgba(255,255,255,.18); --stroke: rgba(255,255,255,.22);
+    background: rgba(38,38,40,.82);
+    box-shadow: 0 0 0 1px rgba(255,255,255,.14), 0 0 0 1.5px rgba(0,0,0,.5), 0 22px 60px rgba(0,0,0,.5);
+  }
+  .light .panel {
+    --label: rgba(0,0,0,.88); --secondary: rgba(0,0,0,.5); --tertiary: rgba(0,0,0,.3);
+    --sep: rgba(0,0,0,.1); --fill: rgba(0,0,0,.07); --fill2: rgba(0,0,0,.1); --stroke: rgba(0,0,0,.12);
+    background: rgba(244,244,246,.78);
+    box-shadow: 0 0 0 1px rgba(255,255,255,.6), 0 0 0 1.5px rgba(0,0,0,.14), 0 22px 60px rgba(0,0,0,.28);
+  }
+  .field { display: flex; align-items: center; height: 56px; padding: 0 22px; color: var(--label); }
+  .field svg { flex: none; stroke: var(--secondary); margin-right: 16px; }
+  .q { flex: 1; min-width: 0; font-size: 25px; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; display: flex; align-items: center; }
+  .q .ph { color: var(--tertiary); }
+  .q .comp { color: var(--secondary); background: var(--fill2); border-radius: 8px; padding: 1px 7px 1px 2px; margin-left: 1px; }
+  .caret { width: 2px; height: 30px; background: var(--secondary); border-radius: 1px; flex: none; }
+  .fieldicon { flex: none; width: 26px; height: 26px; border-radius: 6px; display: grid; place-items: center; font-size: 12px; font-weight: 700; color: #fff; margin-left: 12px; }
+  .fieldicon.glyph { background: var(--fill2); color: var(--secondary); }
+  .body { position: relative; padding: 6px 0 8px; }
+  .body::before { content: ""; position: absolute; top: 0; left: 19px; right: 19px; height: 1px; background: var(--sep); }
+
+  .row { display: flex; align-items: center; height: 56px; margin: 0 9px; padding: 0 8px; border-radius: 18px; color: var(--label); }
+  .row.sel { background: var(--fill); }
+  .icon { flex: none; width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center; font-size: 17px; font-weight: 700; color: #fff; margin-right: 18px; }
+  .icon.glyph { background: var(--fill2); color: var(--secondary); font-size: 16px; }
+  .text { flex: 1; min-width: 0; }
+  .title { font-size: 17px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .title.mono { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 15px; }
+  .sub { font-size: 15px; color: var(--secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { flex: none; width: 5px; height: 5px; border-radius: 50%; background: var(--secondary); margin-left: 10px; }
+  .hint { flex: none; font-size: 11px; color: var(--secondary); display: flex; align-items: center; gap: 7px; margin-left: 10px; }
+  .key { font-size: 11px; height: 17px; padding: 0 6px; border-radius: 5px; display: inline-grid; place-items: center; background: var(--fill2); color: var(--label); }
+
+  .card { margin: 2px 18px 4px; padding: 12px 17px 14px; border-radius: 20px; background: var(--fill); box-shadow: inset 0 0 0 1px var(--stroke); color: var(--label); display: flex; align-items: flex-start; }
+  .card .ex { font-size: 13px; color: var(--secondary); }
+  .card .res { font-size: 17px; font-weight: 500; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .meta { font-size: 11px; color: var(--secondary); margin-top: 10px; }
+  .card .grow { flex: 1; min-width: 0; }
+  .copy { flex: none; width: 26px; height: 26px; border-radius: 50%; background: var(--fill2); display: grid; place-items: center; font-size: 12px; color: var(--label); margin-top: 6px; }
+  .pill .panel { border-radius: 28px; }
+</style>
+</head>
+<body>
+<p class="note">Redrawn to the sizes measured from Spotlight on this Mac. An HTML approximation: the real panel uses the system glass, real app icons and SF Symbols; coloured squares stand in for icons.</p>
+<div class="grid" id="grid"></div>
+<script>
+const search = '<svg width="23" height="23" viewBox="0 0 23 23" fill="none" stroke-width="2" stroke-linecap="round"><circle cx="9.5" cy="9.5" r="6.8"/><path d="M14.8 14.8l5.4 5.4"/></svg>';
+const app = (l, c) => `<div class="icon" style="background:${c}">${l}</div>`;
+const glyph = g => `<div class="icon glyph">${g}</div>`;
+const row = o => `<div class="row ${o.sel ? 'sel' : ''}">${o.icon}<div class="text"><div class="title ${o.mono ? 'mono' : ''}">${o.title}</div>${o.sub ? `<div class="sub">${o.sub}</div>` : ''}</div>${o.running ? '<span class="dot"></span>' : ''}${o.hint ? `<div class="hint">${o.hint}<span class="key">return</span></div>` : ''}</div>`;
+const card = (ex, res, meta) => `<div class="card"><div class="grow"><div class="ex">${ex} =</div><div class="res">${res}</div>${meta ? `<div class="meta">${meta}</div>` : ''}</div><div class="copy">⧉</div></div>`;
+const field = s => `<div class="field">${search}<div class="q">${s.q ? `<span>${s.q}</span>` : ''}<span class="caret"></span>${s.comp ? `<span class="comp">${s.comp}</span>` : ''}${s.q ? '' : '<span class="ph">Search</span>'}</div>${s.ficon || ''}</div>`;
+const fi = (l, c) => `<div class="fieldicon" style="background:${c}">${l}</div>`;
+const fg = g => `<div class="fieldicon glyph">${g}</div>`;
+
+const states = [
+  { name: 'Empty query, option A — bare field, as Spotlight', theme: 'dark' },
+  { name: 'Empty query, option B — your most-used apps', theme: 'dark', body:
+      row({ icon: app('S', '#1e90ff'), title: 'Safari', running: true, sel: true, hint: 'Switch' }) +
+      row({ icon: app('›', '#1b1b1d'), title: 'Terminal', running: true }) +
+      row({ icon: app('Z', '#0b5fd6'), title: 'Zed', running: true }) +
+      row({ icon: app('W', '#25d366'), title: 'WhatsApp' }) },
+  { name: 'Opening an app', theme: 'dark', q: 'te', comp: 'rminal — Switch', ficon: fi('›', '#1b1b1d'), body:
+      row({ icon: app('›', '#1b1b1d'), title: 'Terminal', running: true, sel: true, hint: 'Switch' }) +
+      row({ icon: app('T', '#6d5df6'), title: 'TextSniper' }) +
+      row({ icon: app('T', '#9a9aa0'), title: 'TextEdit' }) },
+  { name: 'Calculation', theme: 'dark', q: '2400 + 18%', comp: '= 2,832', ficon: fg('='), body:
+      card('2400 + 18%', '2,832') },
+  { name: 'Currency', theme: 'dark', q: '100 usd to inr', comp: '= 9,267.00 INR', ficon: fg('='), body:
+      card('100 usd to inr', '9,267.00 INR', '1 USD = 92.67 INR · Yahoo Finance · 14:32') },
+  { name: 'Website keyword', theme: 'dark', q: 'gh rust-lang/rust', ficon: fg('↗'), body:
+      row({ icon: glyph('↗'), title: 'Open rust-lang/rust on GitHub', sub: 'github.com/rust-lang/rust', sel: true, hint: 'Open' }) },
+  { name: 'Ask about a command', theme: 'dark', q: '? find files larger than 1 GB', ficon: fg('›_'), body:
+      row({ icon: glyph('›_'), title: 'find . -type f -size +1G', mono: true, sub: 'Lists regular files over 1 GB under the current folder', sel: true, hint: 'Copy' }) +
+      row({ icon: glyph('›_'), title: 'du -ah . | sort -rh | head -20', mono: true, sub: 'The 20 largest files and folders, biggest first' }) },
+  { name: 'Light appearance', theme: 'light', q: 'te', comp: 'rminal — Switch', ficon: fi('›', '#1b1b1d'), body:
+      row({ icon: app('›', '#1b1b1d'), title: 'Terminal', running: true, sel: true, hint: 'Switch' }) +
+      row({ icon: app('T', '#6d5df6'), title: 'TextSniper' }) },
+];
+document.getElementById('grid').innerHTML = states.map(s =>
+  `<div class="stage ${s.theme}"><div class="caption">${s.name}</div><div class="panel">${field(s)}${s.body ? `<div class="body">${s.body}</div>` : ''}</div></div>`
+).join('');
+</script>
+</body>
+</html>
