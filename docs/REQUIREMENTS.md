@@ -125,7 +125,7 @@ Priority: **M1** daily driver, **M2**, **Later** (designed for, not scheduled).
 | FR-40 | Each result has one primary action on Return. Command-K lists the selected row's other actions in the panel: for apps Show in Finder, Copy Path, and Quit and Force Quit when running; Copy Link for links; copy with the expression for values; Ask another tool for questions and answers. Escape or Command-K goes back. | Built |
 | FR-50 | Configuration is one TOML file: hotkey, aliases, website keywords, default currency, Ask endpoint. A malformed edit keeps the last good configuration and reports the error in the panel. | M1 |
 | FR-54 | Appearance follows the system light/dark setting, uses system materials, and honours Reduce Transparency and Increase Contrast. | M1 |
-| FR-51 | A settings window. | Later |
+| FR-51 | A Settings window in four toolbar tabs. General: record the shortcut (applied at once, no restart), open at login, menu bar icon, Input Monitoring state. Appearance: glass colour with a live preview, strength, motion. Search: default currency, Ask tool, aliases and website keywords as editable lists. Advanced: configuration file, log, reset learned ranking, version. Every control saves to config.toml, keeping its comments, and applies at once. Decided by the author on 2026-11-22. | Built |
 
 ### 5.5 Visual design
 
@@ -133,7 +133,7 @@ Decided by the author on 2026-11-21: **the panel matches Spotlight on macOS 27**
 
 | ID | Requirement | Priority |
 |---|---|---|
-| DS-1 | System font, SF Symbols for non-app rows, real app icons, system label colours, the user's accent colour. No custom palette, no theme engine. | M1 |
+| DS-1 | System font, SF Symbols for non-app rows, real app icons, system label colours, the user's accent colour. No custom palette. Exception decided by the author on 2026-11-22: an optional colour on the glass (`theme`): the selected result's colour, a slow aurora drift, the accent colour, one fixed colour, or none. It is a gradient layer inside the glass, so it moves with DS-4's springs. | M1 |
 | DS-2 | Background is the system glass material Spotlight uses (`NSGlassEffectView`), if the `objc2` bindings expose it and it fits the 40 MB empty-panel budget; both are checked in S1. Otherwise `NSVisualEffectView`, which is close but not identical. | M1 |
 | DS-3 | Sizes follow Spotlight as measured on the author's Mac (table below). | M1 |
 | DS-3a | The completion is a separate, non-editable overlay placed after the typed text, never part of the field's string, and is not an accessibility element. It is hidden during input-method composition and when the caret is not at the end. When the selected title does not continue what was typed (an alias, an acronym), it shows ` — Title` instead of a tail. The query field shows an inline completion after the caret, as Spotlight does: the rest of the top result's name and its action (`te` → `rminal — Open`), or `= result` for a calculation or conversion, with the result's icon at the trailing edge of the field. | M1 |
@@ -264,7 +264,7 @@ Every addition is keyword-scoped or opt-in, so the default result list stays as 
 | Emoji picker, snippets, system commands, window switcher | Not in the author's stated use. Each is a later provider if wanted. |
 | Chat pane, conversation history, AI over files or screen | Ask is one question, one answer, in rows. |
 | Raycast extension compatibility, extension store | Needs Node and a React reconciler; other projects are well ahead. |
-| Settings window, CLI, URL scheme, updater, notarised DMG | Only needed once someone else uses it. |
+| CLI, URL scheme, updater, notarised DMG | Only needed once someone else uses it. (A Settings window was built on the author's request: FR-51.) |
 | Linux and Windows | The author uses macOS. |
 | Accounts, sync, telemetry | D9. |
 

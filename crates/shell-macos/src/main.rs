@@ -11,21 +11,21 @@
 mod apps;
 mod ask;
 mod config;
+mod hotkey;
 mod keytap;
 mod rates;
 mod settings;
 mod store;
+mod theme;
 mod ui;
 mod watch;
 
 use std::cell::RefCell;
 use std::time::Instant;
 
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
 use ui::Controller;
 
@@ -65,52 +65,6 @@ fn diagnostics(args: &[String]) -> bool {
     true
 }
 
-/// `cmd+space`, `option+space`, `ctrl+shift+space`: modifiers, then Space.
-fn parse_hotkey(text: &str) -> Option<(Modifiers, String)> {
-    let mut mods = Modifiers::empty();
-    let mut names = Vec::new();
-    let mut key = false;
-    for part in text.split('+').map(|p| p.trim().to_lowercase()) {
-        match part.as_str() {
-            "cmd" | "command" | "super" | "meta" => {
-                mods |= Modifiers::META;
-                names.push("Command");
-            }
-            "opt" | "option" | "alt" => {
-                mods |= Modifiers::ALT;
-                names.push("Option");
-            }
-            "ctrl" | "control" => {
-                mods |= Modifiers::CONTROL;
-                names.push("Control");
-            }
-            "shift" => {
-                mods |= Modifiers::SHIFT;
-                names.push("Shift");
-            }
-            "space" => key = true,
-            _ => return None,
-        }
-    }
-    (key && !mods.is_empty()).then(|| (mods, format!("{}-Space", names.join("-"))))
-}
-
-/// The same modifiers, as a menu draws them beside an item.
-fn menu_modifiers(mods: Modifiers) -> NSEventModifierFlags {
-    let mut flags = NSEventModifierFlags::empty();
-    for (m, f) in [
-        (Modifiers::META, NSEventModifierFlags::Command),
-        (Modifiers::ALT, NSEventModifierFlags::Option),
-        (Modifiers::CONTROL, NSEventModifierFlags::Control),
-        (Modifiers::SHIFT, NSEventModifierFlags::Shift),
-    ] {
-        if mods.contains(m) {
-            flags |= f;
-        }
-    }
-    flags
-}
-
 fn toggle_panel() {
     // Clone the handle out so no borrow is held while AppKit runs.
     let controller = CONTROLLER.with_borrow(|c| c.clone());
@@ -139,48 +93,10 @@ fn main() {
     // Hotkey. A failure here must leave the app usable from the menu bar (FR-1).
     // RS_HOTKEY overrides the configuration file, for testing.
     let wanted = std::env::var("RS_HOTKEY").unwrap_or_else(|_| config::load(None).config.hotkey);
-    let (mods, name) = parse_hotkey(&wanted).unwrap_or_else(|| {
-        eprintln!("[rs] hotkey {wanted:?} not understood; using option+space");
-        (Modifiers::ALT, "Option-Space".to_string())
-    });
-    let hotkey = HotKey::new(Some(mods), Code::Space);
-    let hotkey_id = hotkey.id();
-    let manager = GlobalHotKeyManager::new();
-    let (registered, hotkey_status) = match &manager {
-        Ok(m) => match m.register(hotkey) {
-            Ok(()) => (true, format!("Hotkey: {name}")),
-            Err(e) => (false, format!("Shortcut {name} unavailable: {e}")),
-        },
-        Err(e) => (false, format!("Shortcuts unavailable: {e}")),
-    };
-    eprintln!("[rs] {hotkey_status}");
-    // The Carbon handler runs on the main thread's event target.
-    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-        if event.id != hotkey_id || event.state != HotKeyState::Pressed {
-            return;
-        }
-        if MainThreadMarker::new().is_none() {
-            eprintln!("[rs] hotkey event arrived off the main thread; ignored");
-            return;
-        }
-        if keytap::claim() {
-            return; // the key tap already acted on this press
-        }
-        ui::event_log(if keytap::active() { "hotkey pressed (Carbon; the key tap missed it)" } else { "hotkey pressed" });
-        toggle_panel();
-    }));
-    if registered {
-        // Catches the same press earlier, ahead of other apps' keyboard taps.
-        keytap::start(menu_modifiers(mods).bits() as u64, toggle_panel);
-    }
+    hotkey::init(&wanted, toggle_panel);
 
     // Menu bar item: Open, Settings, Quit. It can be hidden from Settings.
-    let shown_hotkey = if registered {
-        Ok((name.clone(), menu_modifiers(mods)))
-    } else {
-        Err(hotkey_status.clone())
-    };
-    settings::install(&controller, shown_hotkey, mtm);
+    settings::install(&controller, mtm);
     app.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*controller)));
 
     // A rate that arrives while the panel is open is shown as a new presentation.
@@ -193,5 +109,4 @@ fn main() {
     CONTROLLER.set(Some(controller));
     watch::start();
     app.run();
-    drop(manager);
 }

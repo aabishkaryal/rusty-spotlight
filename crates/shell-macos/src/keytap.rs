@@ -49,7 +49,6 @@ const DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 const FIELD_AUTOREPEAT: u32 = 8;
 const FIELD_KEYCODE: u32 = 9;
-const SPACE: i64 = 49;
 /// Shift, Control, Option, Command: the same bits as NSEventModifierFlags.
 const MODIFIERS: u64 = 0x1E_0000;
 /// Longest a stalled tap was seen to hold a key, with room to spare.
@@ -58,6 +57,8 @@ const SAME_PRESS: Duration = Duration::from_secs(5);
 thread_local! {
     static TAP: Cell<Port> = const { Cell::new(std::ptr::null_mut()) };
     static WANT: Cell<u64> = const { Cell::new(0) };
+    /// macOS key code of the shortcut's key; with WANT 0 nothing is watched.
+    static KEY: Cell<i64> = const { Cell::new(49) };
     static ON_PRESS: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// Presses the tap acted on that the Carbon event has not yet matched.
     static PENDING: RefCell<VecDeque<Instant>> = const { RefCell::new(VecDeque::new()) };
@@ -74,8 +75,9 @@ extern "C" fn on_event(_proxy: *mut c_void, kind: u32, event: *mut c_void, _user
             }
         }
         KEY_DOWN => unsafe {
-            let is_space = CGEventGetIntegerValueField(event, FIELD_KEYCODE) == SPACE;
-            if is_space
+            let is_key = CGEventGetIntegerValueField(event, FIELD_KEYCODE) == KEY.get();
+            if WANT.get() != 0
+                && is_key
                 && CGEventGetIntegerValueField(event, FIELD_AUTOREPEAT) == 0
                 && CGEventGetFlags(event) & MODIFIERS == WANT.get()
             {
@@ -112,10 +114,16 @@ fn create() -> bool {
     true
 }
 
-/// Start watching for `modifiers` + Space. Asks for Input Monitoring the
-/// first time; until it is allowed, the Carbon hotkey works alone.
-pub fn start(modifiers: u64, on_press: impl Fn() + 'static) {
+/// Which shortcut to catch: modifier flags and a macOS key code. Modifiers
+/// 0 watches nothing (while Settings records a new shortcut).
+pub fn watch(modifiers: u64, keycode: u16) {
     WANT.set(modifiers & MODIFIERS);
+    KEY.set(i64::from(keycode));
+}
+
+/// Start the tap. Asks for Input Monitoring the first time; until it is
+/// allowed, the Carbon hotkey works alone.
+pub fn start(on_press: impl Fn() + 'static) {
     ON_PRESS.set(Some(Rc::new(on_press)));
     if unsafe { CGPreflightListenEventAccess() } {
         if !create() {
@@ -132,7 +140,7 @@ pub fn start(modifiers: u64, on_press: impl Fn() + 'static) {
 /// Called every couple of seconds: picks up a permission granted since
 /// launch, and logs a press the Carbon hotkey never delivered.
 pub fn tick() {
-    if WANT.get() != 0 && TAP.get().is_null() && unsafe { CGPreflightListenEventAccess() } && !create() && !WARNED.replace(true) {
+    if ON_PRESS.with_borrow(Option::is_some) && TAP.get().is_null() && unsafe { CGPreflightListenEventAccess() } && !create() && !WARNED.replace(true) {
         event_log("key tap could not be created although Input Monitoring is allowed");
     }
     let lost = PENDING.with_borrow_mut(|p| {

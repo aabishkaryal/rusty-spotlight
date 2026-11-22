@@ -17,6 +17,12 @@ pub struct Config {
     /// Show the magnifying glass in the menu bar. Settings stay reachable from
     /// the launcher ("settings") and by opening the app again in Finder.
     pub menu_bar_icon: bool,
+    /// Colour on the glass: selection, aurora, accent, none, or "#rrggbb".
+    pub theme: String,
+    /// How strong that colour is: mild, medium, strong, or 0 to 1.
+    pub theme_strength: String,
+    /// The opening and resizing springs. Off: the panel appears at its size.
+    pub animations: bool,
     /// `alias = "App name"`: typing the alias ranks that app first.
     pub aliases: BTreeMap<String, String>,
     /// `keyword = "https://…{query}…"`: typing `keyword words` opens the URL.
@@ -50,16 +56,19 @@ impl Default for Ask {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { hotkey: "option+space".into(), default_currency: "INR".into(), menu_bar_icon: true, aliases: BTreeMap::new(), links: BTreeMap::new(), ask: Ask::default() }
+        Self { hotkey: "option+space".into(), default_currency: "INR".into(), menu_bar_icon: true, theme: "selection".into(), theme_strength: "mild".into(), animations: true, aliases: BTreeMap::new(), links: BTreeMap::new(), ask: Ask::default() }
     }
 }
 
-const TEMPLATE: &str = r#"# rusty-spotlight configuration. Saved changes apply the next time the panel opens.
+const TEMPLATE: &str = r##"# rusty-spotlight configuration. Saved changes apply the next time the panel opens.
 
-# The shortcut that opens the panel: modifiers and space, e.g. "cmd+space" or
-# "option+space". Takes effect when the launcher restarts. For "cmd+space", first
-# turn off Spotlight's own shortcut in System Settings > Keyboard > Keyboard
-# Shortcuts > Spotlight.
+# Most of this can be set in Settings (menu bar icon > Settings…, or type
+# "settings" in the launcher), which saves here.
+
+# The shortcut that opens the panel: Command, Option, Control or Shift, plus
+# Space, a letter or a digit, e.g. "cmd+space" or "ctrl+opt+k". For "cmd+space",
+# first turn off Spotlight's own shortcut in System Settings > Keyboard >
+# Keyboard Shortcuts > Spotlight.
 hotkey = "option+space"
 
 # Used when a conversion names only one currency, e.g. "100 usd".
@@ -68,6 +77,17 @@ default_currency = "INR"
 # Show the icon in the menu bar. When it is hidden, type "settings" in the
 # launcher, or open Rusty Spotlight again in Finder, to reach the settings.
 menu_bar_icon = true
+
+# Colour on the glass. "selection" takes the selected app's colour (or one per
+# kind of result) and cross-fades as you move; "aurora" drifts slowly through
+# a few colours; "accent" uses the system accent colour; "#7c5cff" is one
+# fixed colour; "none" is plain glass.
+theme = "selection"
+# How strong the colour is: "mild", "medium", "strong", or a number 0 to 1.
+theme_strength = "mild"
+
+# The opening and resizing springs. false: the panel appears at its size.
+animations = true
 
 # alias = "App name": typing the alias puts that app first.
 [aliases]
@@ -89,7 +109,7 @@ default = "claude"
 claude = ["~/.local/bin/claude", "-p", "{question}", "--model", "haiku"]
 codex = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "{question}"]
 grok = ["grok", "-p", "{question}", "--no-subagents"]
-"#;
+"##;
 
 pub fn path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -135,9 +155,7 @@ pub fn load(previous: Option<&Config>) -> Loaded {
 /// Set one top-level `key = value` line, keeping every other line and comment.
 /// `value` is written as given, so strings must carry their own quotes.
 pub fn set_value(key: &str, value: &str) -> std::io::Result<()> {
-    let path = path().ok_or_else(|| std::io::Error::other("no home folder"))?;
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| TEMPLATE.to_string());
-    std::fs::write(&path, with_value(&text, key, value))
+    edit_file(|text| with_value(text, key, value))
 }
 
 fn with_value(text: &str, key: &str, value: &str) -> String {
@@ -165,6 +183,103 @@ fn with_value(text: &str, key: &str, value: &str) -> String {
     let mut out = lines.join("\n");
     out.push('\n');
     out
+}
+
+/// A TOML string, quoted and escaped: `"a \"b\""`.
+pub fn quote(text: &str) -> String {
+    toml::Value::String(text.to_string()).to_string()
+}
+
+/// A key as TOML writes it: bare when it can be, quoted otherwise.
+fn toml_key(key: &str) -> String {
+    let bare = !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if bare { key.to_string() } else { quote(key) }
+}
+
+fn edit_file(change: impl FnOnce(&str) -> String) -> std::io::Result<()> {
+    let path = path().ok_or_else(|| std::io::Error::other("no home folder"))?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| TEMPLATE.to_string());
+    let new = change(&text);
+    // Never write a file the launcher could not read back.
+    toml::from_str::<Config>(&new).map_err(|e| std::io::Error::other(e.message().to_string()))?;
+    std::fs::write(&path, new)
+}
+
+/// The lines of `[table]`: from its header to the next header or the end.
+fn table_span(lines: &[String], table: &str) -> Option<(usize, usize)> {
+    let header = format!("[{table}]");
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let end = lines[start + 1..].iter().position(|l| l.trim_start().starts_with('[')).map_or(lines.len(), |i| start + 1 + i);
+    Some((start, end))
+}
+
+fn is_entry(line: &str) -> bool {
+    let t = line.trim_start();
+    !t.is_empty() && !t.starts_with('#') && t.contains('=')
+}
+
+fn entry_key(line: &str) -> Option<String> {
+    let (k, _) = line.split_once('=')?;
+    let k = k.trim();
+    Some(toml::from_str::<toml::Table>(&format!("{k} = 0")).ok()?.keys().next()?.clone())
+}
+
+/// Replace every `key = "value"` line of `[table]` with `entries`, keeping
+/// its comments; the table is added at the end if it is missing.
+fn with_table(text: &str, table: &str, entries: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let new: Vec<String> = entries.iter().map(|(k, v)| format!("{} = {}", toml_key(k), quote(v))).collect();
+    match table_span(&lines, table) {
+        Some((start, end)) => {
+            let mut block: Vec<String> = lines[start + 1..end].iter().filter(|l| !is_entry(l)).cloned().collect();
+            // New entries go after the table's own comments, before trailing blank lines.
+            let at = block.iter().rposition(|l| !l.trim().is_empty()).map_or(0, |i| i + 1);
+            block.splice(at..at, new);
+            lines.splice(start + 1..end, block);
+        }
+        None => {
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(format!("[{table}]"));
+            lines.extend(new);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Set one `key = value` line inside `[table]`. `value` is written as given.
+fn with_table_value(text: &str, table: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let line = format!("{} = {value}", toml_key(key));
+    match table_span(&lines, table) {
+        Some((start, end)) => {
+            match (start + 1..end).find(|&i| is_entry(&lines[i]) && entry_key(&lines[i]).as_deref() == Some(key)) {
+                Some(i) => lines[i] = line,
+                None => lines.insert(start + 1, line),
+            }
+        }
+        None => {
+            lines.push(String::new());
+            lines.push(format!("[{table}]"));
+            lines.push(line);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Save `[aliases]` or `[links]` as a whole.
+pub fn set_table(table: &str, entries: &[(String, String)]) -> std::io::Result<()> {
+    edit_file(|text| with_table(text, table, entries))
+}
+
+/// Save one key inside a table, e.g. `default` in `[ask]`.
+pub fn set_table_value(table: &str, key: &str, value: &str) -> std::io::Result<()> {
+    edit_file(|text| with_table_value(text, table, key, value))
 }
 
 /// Whether the file changed since `since`.
@@ -258,6 +373,30 @@ mod tests {
         assert_eq!(c.ask.default, "claude");
         assert_eq!(c.ask.tools.len(), 3);
     }
+
+    #[test]
+    fn tables_are_rewritten_in_place() {
+        let text = "a = 1\n\n# note\n[aliases]\n# ff = \"Firefox\"\nold = \"X\"\n\n[links]\ng = \"https://g/{query}\"\n";
+        let entries = vec![("ff".to_string(), "Firefox".to_string()), ("my app".to_string(), "Say \"Hi\"".to_string())];
+        let out = with_table(text, "aliases", &entries);
+        assert_eq!(out, "a = 1\n\n# note\n[aliases]\n# ff = \"Firefox\"\nff = \"Firefox\"\n\"my app\" = 'Say \"Hi\"'\n\n[links]\ng = \"https://g/{query}\"\n");
+        let parsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.aliases.get("my app").map(String::as_str), Some("Say \"Hi\""));
+        assert_eq!(parsed.links.len(), 1);
+        // Emptied: the comment stays, the entries go.
+        assert!(!with_table(&out, "aliases", &[]).contains("\nff = "));
+        // Missing: added at the end.
+        assert!(toml::from_str::<Config>(&with_table("a = 1\n", "links", &entries)).is_ok_and(|c| c.links.len() == 2));
+    }
+
+    #[test]
+    fn a_table_value_is_replaced() {
+        let out = with_table_value(TEMPLATE, "ask", "default", "\"grok\"");
+        assert_eq!(toml::from_str::<Config>(&out).unwrap().ask.default, "grok");
+        assert_eq!(out.matches("default = ").count(), 1);
+        assert_eq!(toml::from_str::<Config>(&out).unwrap().ask.tools.len(), 3);
+    }
+
 }
 
 /// `? question` or `?name question` → (tool name, question).

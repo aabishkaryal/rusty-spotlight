@@ -86,6 +86,8 @@ thread_local! {
     static SHOWN_OVER: Cell<i32> = const { Cell::new(-1) };
     /// How many times the panel has taken the keyboard back since it was shown.
     static RETAKES: Cell<u32> = const { Cell::new(0) };
+    /// The panel was just moved to the active Space; the next check reports how that went.
+    static REPAIRED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A window that keeps taking the keyboard is not fought forever.
@@ -362,6 +364,8 @@ pub struct State {
     selected: Cell<usize>,
     running: RefCell<HashSet<String>>,
     icons: RefCell<HashMap<String, Retained<NSImage>>>,
+    /// Colour on the glass (`theme` in config.toml).
+    tint: Option<crate::theme::Tint>,
     /// Rows the surface is currently sized for.
     shown_height: Cell<f64>,
     ask: RefCell<Option<AskRun>>,
@@ -476,28 +480,17 @@ define_class!(
             crate::settings::show(self);
         }
 
-        #[unsafe(method(toggleMenuBarIcon:))]
-        fn toggle_menu_bar_icon(&self, sender: Option<&AnyObject>) {
-            crate::settings::toggled(sender);
-        }
-
         // Command-K, sent up the responder chain from the panel.
         #[unsafe(method(rsShowActions:))]
         fn show_actions(&self, _sender: Option<&AnyObject>) {
             self.toggle_actions();
         }
 
-        #[unsafe(method(openInputMonitoring:))]
-        fn open_input_monitoring(&self, _sender: Option<&AnyObject>) {
-            crate::keytap::open_settings();
+        #[unsafe(method(rsCheckOnScreen))]
+        fn rs_check_on_screen(&self) {
+            self.check_on_screen();
         }
 
-        #[unsafe(method(openConfigFile:))]
-        fn open_config_file(&self, _sender: Option<&AnyObject>) {
-            if let Some(path) = config::path() {
-                NSWorkspace::sharedWorkspace().openURL(&NSURL::fileURLWithPath(&ns(&path.to_string_lossy())));
-            }
-        }
     }
 );
 
@@ -599,6 +592,12 @@ impl Controller {
         content.setFrameOrigin(NSPoint::new(0.0, FIELD_H - MAX_H));
         content.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin);
         let clip = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        // The tint sits under everything else inside the glass, so it rides
+        // the same springs as the surface.
+        let tint = crate::theme::Tint::new(rect, mtm);
+        if let Some(tint) = &tint {
+            clip.addSubview(tint.view());
+        }
         clip.addSubview(&content);
 
         let field = NSTextField::initWithFrame(
@@ -757,6 +756,7 @@ impl Controller {
         let state = State {
             panel,
             surface,
+            tint,
             shadow,
             content,
             field,
@@ -824,7 +824,7 @@ impl Controller {
         s.query.borrow_mut().clear();
         self.place();
         self.present();
-        s.panel.orderFrontRegardless();
+        self.order_front_here();
         s.panel.makeKeyWindow();
         let focused = s.panel.makeFirstResponder(Some(&s.field));
         // The shared field editor carries its own typing aids; turn them off too.
@@ -858,6 +858,53 @@ impl Controller {
         ));
     }
 
+    /// Show the panel on the Space in use. A long-running copy was seen
+    /// opening only on the desktop, not over a full-screen app, after the
+    /// screen had been locked; a fresh copy never did, and the cause is not
+    /// known. So the level and Spaces setting are applied again on every
+    /// summon, and a moment later `rsCheckOnScreen` asks the window server
+    /// whether the panel really is on screen, and moves it here if not.
+    fn order_front_here(&self) {
+        let panel = &self.ivars().panel;
+        panel.setLevel(panel.level());
+        panel.setCollectionBehavior(panel.collectionBehavior());
+        panel.orderFrontRegardless();
+        REPAIRED.set(false);
+        // `isOnActiveSpace` lags behind an order-front, so check on a later turn.
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(rsCheckOnScreen), withObject: std::ptr::null::<AnyObject>(), afterDelay: 0.15f64]
+        };
+    }
+
+    fn check_on_screen(&self) {
+        let panel = &self.ivars().panel;
+        if !panel.isVisible() || on_screen(panel.windowNumber()) {
+            if REPAIRED.replace(false) {
+                event_log("panel was not on the Space in use; moved it there");
+            }
+            return;
+        }
+        if REPAIRED.get() {
+            REPAIRED.set(false);
+            event_log("panel is not on the Space in use, and moving it failed");
+            return;
+        }
+        let behavior = panel.collectionBehavior();
+        panel.orderOut(None);
+        panel.setCollectionBehavior(
+            NSWindowCollectionBehavior::MoveToActiveSpace
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        panel.orderFrontRegardless();
+        panel.makeKeyWindow();
+        panel.setCollectionBehavior(behavior);
+        REPAIRED.set(true);
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(rsCheckOnScreen), withObject: std::ptr::null::<AnyObject>(), afterDelay: 0.15f64]
+        };
+    }
+
     /// Spotlight's opening animation, measured from a 60 fps recording over a
     /// black card on macOS 27.2: the field is first visible at about 110% of
     /// its width and 96% of its height, and reaches its resting shape in
@@ -865,9 +912,7 @@ impl Controller {
     /// 75 ms. Purely visual: the field already has focus.
     /// Skipped under Reduce Motion or with RS_ANIM=off.
     fn animate_in(&self) {
-        if env("RS_ANIM", "on") == "off"
-            || NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
-        {
+        if !self.animate() {
             return;
         }
         let s = self.ivars();
@@ -939,6 +984,9 @@ impl Controller {
             event_log("hidden: dismissed");
             panel.orderOut(None);
         }
+        if let Some(tint) = &self.ivars().tint {
+            tint.stop();
+        }
     }
 
     /// Pick the screen under the pointer and fix the panel's top edge on it.
@@ -983,9 +1031,7 @@ impl Controller {
         s.scroll.setHidden(!rows);
         s.shown_height.set(rows_height);
 
-        let animate = animate
-            && env("RS_ANIM", "on") != "off"
-            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        let animate = animate && self.animate();
         if !animate {
             self.stop_spring();
             self.set_height(h);
@@ -1009,6 +1055,12 @@ impl Controller {
 
     fn set_height(&self, h: f64) {
         let s = self.ivars();
+        // The spring gives fractional heights. Unrounded, the glass and the
+        // rows pinned to its top round to different pixels on alternate
+        // frames, and the rows shiver by a pixel while the panel grows. Snap
+        // to the display's pixel grid so every edge moves in whole pixels.
+        let scale = s.panel.backingScaleFactor().max(1.0);
+        let h = (h * scale).round() / scale;
         let frame = NSRect::new(NSPoint::new(MARGIN, MARGIN + MAX_H - h), NSSize::new(PANEL_W, h));
         s.shadow.setFrame(frame);
         update_shadow(&s.shadow, PANEL_W, h);
@@ -1041,6 +1093,31 @@ impl Controller {
     // ------------------------------------------------------------ results
 
     /// Read the configuration and rebuild the catalog with its aliases.
+    /// Settings saved a change: read the file now rather than on the next summon.
+    pub fn apply_settings(&self) {
+        self.reload_config(false);
+    }
+
+    /// The configuration in use, for Settings to show.
+    pub fn config(&self) -> config::Config {
+        self.ivars().config.borrow().clone()
+    }
+
+    /// Forget what was learned from use (FR-12).
+    pub fn reset_learning(&self) -> std::io::Result<()> {
+        let mut usage = self.ivars().usage.borrow_mut();
+        *usage = Usage::default();
+        store::save(&usage)
+    }
+
+    /// The opening and resizing springs: off with `animations = false`,
+    /// RS_ANIM=off or Reduce Motion.
+    fn animate(&self) -> bool {
+        self.ivars().config.borrow().animations
+            && env("RS_ANIM", "on") != "off"
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
+
     fn reload_config(&self, first: bool) {
         let s = self.ivars();
         let previous = (!first).then(|| s.config.borrow().clone());
@@ -1051,7 +1128,11 @@ impl Controller {
             eprintln!("[rs] config.toml: {error}");
         }
         *s.config_error.borrow_mut() = loaded.error;
-        crate::settings::set_icon_visible(s.config.borrow().menu_bar_icon);
+        crate::settings::config_changed(&s.config.borrow());
+        if let Some(tint) = &s.tint {
+            let config = s.config.borrow();
+            tint.set_theme(crate::theme::parse(&config.theme), crate::theme::strength(&config.theme_strength));
+        }
         let items = self.scan_apps();
         *s.items.borrow_mut() = items;
     }
@@ -1400,6 +1481,7 @@ impl Controller {
         }
         .filter(|t| !t.is_empty());
         let selected = s.rows.borrow().get(s.selected.get()).cloned();
+        self.update_tint(selected.as_ref());
         match &selected {
             Some(row) if !query.is_empty() && matches!(row.kind, Kind::App { .. }) => {
                 s.field_icon.setImage(Some(&self.icon(&row.id)));
@@ -1427,6 +1509,31 @@ impl Controller {
             NSSize::new(size.width.min(max_w), field.size.height),
         ));
         s.completion.setHidden(max_w < 40.0);
+    }
+
+    /// Colour the glass for the selected row. An action list keeps the colour
+    /// of the row it belongs to.
+    fn update_tint(&self, row: Option<&Row>) {
+        use crate::theme::Subject;
+        let Some(tint) = &self.ivars().tint else { return };
+        let icon;
+        let subject = match row {
+            None => Subject::Nothing,
+            Some(row) => match &row.kind {
+                Kind::Action { .. } => return,
+                Kind::App { .. } => {
+                    icon = self.icon(&row.id);
+                    Subject::App(&icon, &row.id)
+                }
+                Kind::Value { .. } if row.id == "time" => Subject::Time,
+                Kind::Value { .. } if row.id == "units" => Subject::Units,
+                Kind::Value { .. } => Subject::Calc,
+                Kind::Link { .. } => Subject::Link,
+                Kind::Ask { .. } | Kind::Answer { .. } => Subject::Ask,
+                Kind::Notice { .. } => Subject::Notice,
+            },
+        };
+        tint.update(&subject);
     }
 
     /// Right arrow or Tab at the end of the text: take the completed title.
@@ -1872,6 +1979,30 @@ impl Controller {
     }
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> *mut AnyObject;
+}
+
+/// Whether the window server has this window on screen now, in the Space in use.
+fn on_screen(window: NSInteger) -> bool {
+    const ON_SCREEN_ONLY: u32 = 1;
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY, 0);
+        if list.is_null() {
+            return true; // cannot tell; do not move anything
+        }
+        let list = Retained::from_raw(list).expect("non-null");
+        let list: &objc2_foundation::NSArray<objc2_foundation::NSDictionary<NSString, AnyObject>> = &*(Retained::as_ptr(&list) as *const _);
+        let key = ns("kCGWindowNumber");
+        list.iter().any(|info| {
+            info.objectForKey(&key)
+                .and_then(|n| n.downcast::<NSNumber>().ok())
+                .is_some_and(|n| n.integerValue() == window)
+        })
+    }
+}
+
 fn copy_text(text: &str) {
     let pasteboard = NSPasteboard::generalPasteboard();
     pasteboard.clearContents();
@@ -1900,7 +2031,7 @@ fn own_bundle() -> Option<String> {
 }
 
 /// `claude` → `Claude`.
-fn display_name(tool: &str) -> String {
+pub fn display_name(tool: &str) -> String {
     let mut chars = tool.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),

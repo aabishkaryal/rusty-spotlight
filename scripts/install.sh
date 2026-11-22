@@ -59,8 +59,16 @@ cat > "$AGENT" <<PLIST
 </dict>
 </plist>
 PLIST
-launchctl bootstrap "gui/$(id -u)" "$AGENT"
+# "Open at login" switched off in Settings disables the login item; macOS then
+# refuses to load it, so start the app directly instead.
+if launchctl print-disabled "gui/$(id -u)" | grep -q "\"$LABEL\" => \(disabled\|true\)"; then
+  open "$APP"
+  WHEN="Open at login is off (Settings > General)."
+else
+  launchctl bootstrap "gui/$(id -u)" "$AGENT"
+  WHEN="Starts at login."
+fi
 
 echo "Installed $APP"
-echo "Starts at login. Log: $LOGS/launcher.log"
+echo "$WHEN Log: $LOGS/launcher.log"
 echo "To remove: scripts/uninstall.sh"
