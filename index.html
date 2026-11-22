@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rusty Spotlight</title>
+<meta name="description" content="A fast Spotlight replacement for macOS, written in Rust, on the same Liquid Glass: apps, calculator, currency, units, world time, websites and Ask.">
+<meta property="og:title" content="Rusty Spotlight">
+<meta property="og:description" content="A fast Spotlight replacement for macOS, written in Rust, on Liquid Glass.">
+<meta property="og:image" content="demo-poster.png">
+<link rel="icon" href="AppIcon.png">
+<style>
+  :root {
+    --bg: #0b0c12;
+    --fg: #f2f2f5;
+    --muted: #a3a5b3;
+    --faint: #6d7080;
+    --card: rgba(255, 255, 255, 0.055);
+    --line: rgba(255, 255, 255, 0.10);
+    --rust: #f07a3c;
+    --rust-deep: #b4441a;
+    --radius: 18px;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  /* Soft colour fields behind everything, like the glass sees. */
+  .glow { position: fixed; inset: 0; z-index: -1; pointer-events: none; }
+  .glow span { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .35; }
+  .glow .a { width: 520px; height: 520px; left: -140px; top: -160px; background: #f07a3c; }
+  .glow .b { width: 480px; height: 480px; right: -160px; top: 120px; background: #8f55fa; }
+  .glow .c { width: 560px; height: 560px; left: 30%; top: 70%; background: #1aa8d6; opacity: .22; }
+
+  main { max-width: 1040px; margin: 0 auto; padding: 0 20px 80px; }
+  a { color: var(--rust); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header { text-align: center; padding: 72px 0 36px; }
+  header img.icon { width: 112px; height: 112px; filter: drop-shadow(0 18px 30px rgba(180, 68, 26, .45)); }
+  h1 { font-size: clamp(40px, 7vw, 64px); line-height: 1.05; letter-spacing: -0.03em; margin: 18px 0 14px; font-weight: 700; }
+  .tagline { font-size: clamp(18px, 2.4vw, 22px); color: var(--muted); max-width: 640px; margin: 0 auto; }
+  .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 30px; }
+  .button {
+    display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 999px;
+    font-weight: 600; font-size: 15px; border: 1px solid var(--line); color: var(--fg); background: var(--card);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  }
+  .button.primary { background: linear-gradient(135deg, var(--rust), var(--rust-deep)); border-color: transparent; color: #fff; }
+  .button:hover { text-decoration: none; filter: brightness(1.08); }
+  .note { color: var(--faint); font-size: 13px; margin-top: 14px; }
+
+  .video {
+    margin: 30px auto 0; max-width: 900px; border-radius: 22px; overflow: hidden;
+    border: 1px solid var(--line); box-shadow: 0 40px 90px rgba(0, 0, 0, .55); background: #11131b;
+  }
+  .video video { display: block; width: 100%; height: auto; }
+  .caption { text-align: center; color: var(--faint); font-size: 13px; margin-top: 12px; }
+
+  section { margin-top: 88px; }
+  h2 { font-size: clamp(26px, 4vw, 34px); letter-spacing: -0.02em; margin: 0 0 8px; }
+  .lead { color: var(--muted); margin: 0 0 28px; max-width: 680px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 20px 18px;
+    backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+  }
+  .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+  .card code, li code, p code { font-family: var(--mono); font-size: 13px; background: rgba(255,255,255,.08); padding: 1px 6px; border-radius: 6px; color: var(--fg); }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .stat b { display: block; font-size: 34px; letter-spacing: -0.02em; line-height: 1.1; }
+  .stat span { color: var(--muted); font-size: 14px; }
+  .small { color: var(--faint); font-size: 13px; margin-top: 12px; }
+
+  pre {
+    position: relative; margin: 0; padding: 18px 20px; background: #0f1118; border: 1px solid var(--line);
+    border-radius: var(--radius); overflow-x: auto; font: 14px/1.7 var(--mono); color: #e6e6ea;
+  }
+  pre .c { color: var(--faint); }
+  .copy {
+    position: absolute; top: 10px; right: 10px; font: 600 12px -apple-system, sans-serif; color: var(--muted);
+    background: rgba(255,255,255,.07); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer;
+  }
+  .copy:hover { color: var(--fg); }
+  ol.steps { padding-left: 20px; color: var(--muted); }
+  ol.steps li { margin: 8px 0; }
+  ol.steps b { color: var(--fg); }
+
+  footer { margin-top: 96px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+
+  @media (max-width: 560px) {
+    header { padding-top: 48px; }
+    section { margin-top: 64px; }
+    .stat b { font-size: 28px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .video video { display: none; } .video .still { display: block !important; } }
+</style>
+</head>
+<body>
+<div class="glow" aria-hidden="true"><span class="a"></span><span class="b"></span><span class="c"></span></div>
+<main>
+  <header>
+    <img class="icon" src="AppIcon.png" alt="">
+    <h1>Rusty Spotlight</h1>
+    <p class="tagline">A fast Spotlight replacement for macOS, written in Rust. Same Liquid Glass, same springs, only the things you ask for.</p>
+    <div class="actions">
+      <a class="button primary" href="#install">Install</a>
+      <a class="button" href="https://github.com/blackkspydo/rusty-spotlight">View on GitHub</a>
+    </div>
+    <p class="note">macOS 26 or later · free and open source · built from source on your Mac</p>
+  </header>
+
+  <div class="video">
+    <video src="demo.mp4" poster="demo-poster.png" autoplay muted loop playsinline controls preload="metadata"
+           aria-label="Rusty Spotlight opening on Command-Space, its glass taking each app's colours, the result list springing open, then a sum, a currency conversion, the time in Tokyo, a unit conversion and Command-K actions"></video>
+    <img class="still" src="demo-poster.png" alt="Rusty Spotlight's glass panel with a list of apps" style="display:none;width:100%">
+  </div>
+  <p class="caption">Recorded live on a Mac. Glass colour set to Strong.</p>
+
+  <section>
+    <h2>Everything in one field</h2>
+    <p class="lead">Press the shortcut and type. Results paint as you type; Return acts on what you see.</p>
+    <div class="grid">
+      <div class="card"><h3>Apps</h3><p>A few letters and Return. It learns which results you pick, and switches to an app that's already open.</p></div>
+      <div class="card"><h3>Calculator</h3><p><code>12*7</code>, <code>15% of 2400</code>, <code>2400 + 18%</code>. Return copies the answer.</p></div>
+      <div class="card"><h3>Currency</h3><p><code>100 usd to inr</code>, <code>$100</code>, <code>500 aed</code>. Live rates, cached for offline use.</p></div>
+      <div class="card"><h3>Units</h3><p><code>5 km to mi</code>, <code>70kg in lb</code>, <code>100 f to c</code>, or just <code>6 ft</code>.</p></div>
+      <div class="card"><h3>World time</h3><p><code>time in dubai</code>, <code>sydney time</code>, <code>3pm ist to sydney</code>. Summer time included.</p></div>
+      <div class="card"><h3>Websites</h3><p>Your own keywords: <code>gh rust-lang/rust</code>, <code>yt lofi</code>, or a bare address.</p></div>
+      <div class="card"><h3>Ask</h3><p><code>? how do I untar a file</code> asks Claude Code, Codex or Grok, already on your Mac, and shows the answer.</p></div>
+      <div class="card"><h3>Command-K</h3><p>The selected result's other actions: Show in Finder, Copy Path, Quit, Copy Link, ask another tool.</p></div>
+      <div class="card"><h3>Glass that follows</h3><p>The glass takes each app's colours from its icon and fades as you move. Or Aurora, your accent colour, or plain.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Light on your Mac</h2>
+    <p class="lead">Measured on an Apple Silicon Mac with about 110 apps installed.</p>
+    <div class="stats">
+      <div class="stat"><b>22 ms</b><span>from the shortcut to the panel on screen (typical)</span></div>
+      <div class="stat"><b>&lt; 1 ms</b><span>from a keystroke to new results</span></div>
+      <div class="stat"><b>24 MB</b><span>memory, against 122 MB for Spotlight's own window</span></div>
+      <div class="stat"><b>~0%</b><span>CPU while hidden: under 10 ms a minute, and no indexing</span></div>
+    </div>
+    <p class="small">Rusty Spotlight searches apps, not files, so it needs no index. Spotlight's figure leaves out the indexing services macOS runs anyway.</p>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="lead">It's built on your Mac from the source, which takes a minute or two the first time.</p>
+    <pre><button class="copy" data-copy="install">Copy</button><code id="install-code"><span class="c"># 1. Xcode Command Line Tools and Rust, if you don't have them</span>
+xcode-select --install
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+<span class="c"># 2. Build, install to /Applications, and start at login</span>
+git clone https://github.com/blackkspydo/rusty-spotlight.git
+cd rusty-spotlight
+./scripts/install.sh</code></pre>
+    <ol class="steps">
+      <li><b>Press Option-Space</b> to open it. A magnifying glass appears in the menu bar.</li>
+      <li><b>Allow Input Monitoring</b> when macOS asks, so other apps can't delay or swallow the shortcut. It watches only for its own shortcut.</li>
+      <li><b>To use Command-Space,</b> turn off Spotlight's shortcut in System Settings › Keyboard › Keyboard Shortcuts › Spotlight, then record Command-Space in Rusty Spotlight's Settings.</li>
+    </ol>
+    <p class="small">Update with <code>git pull &amp;&amp; ./scripts/install.sh</code>. Remove with <code>./scripts/uninstall.sh</code>. Everything else is in the <a href="https://github.com/blackkspydo/rusty-spotlight#readme">README</a>.</p>
+  </section>
+
+  <footer>
+    <span>Rusty Spotlight</span>
+    <a href="https://github.com/blackkspydo/rusty-spotlight">github.com/blackkspydo/rusty-spotlight</a>
+  </footer>
+</main>
+<script>
+  for (const b of document.querySelectorAll('.copy')) {
+    b.addEventListener('click', async () => {
+      const text = document.getElementById(b.dataset.copy + '-code').innerText;
+      try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; }
+      catch { b.textContent = 'Select and copy'; }
+      setTimeout(() => (b.textContent = 'Copy'), 1600);
+    });
+  }
+</script>
+</body>
+</html>
