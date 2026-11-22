@@ -15,6 +15,7 @@ mod hotkey;
 mod keytap;
 mod rates;
 mod settings;
+mod spaces;
 mod store;
 mod theme;
 mod ui;

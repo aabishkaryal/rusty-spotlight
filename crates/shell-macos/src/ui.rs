@@ -86,8 +86,6 @@ thread_local! {
     static SHOWN_OVER: Cell<i32> = const { Cell::new(-1) };
     /// How many times the panel has taken the keyboard back since it was shown.
     static RETAKES: Cell<u32> = const { Cell::new(0) };
-    /// The panel was just moved to the active Space; the next check reports how that went.
-    static REPAIRED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A window that keeps taking the keyboard is not fought forever.
@@ -397,9 +395,13 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for Controller {
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _n: &NSNotification) {
+            let t = std::time::Instant::now();
             let text = self.ivars().field.stringValue().to_string();
             *self.ivars().query.borrow_mut() = text;
             self.present();
+            if debug() {
+                eprintln!("[rs] keystroke to results laid out: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
         }
 
         // Keys the field editor did not consume as text. While an input method
@@ -484,6 +486,11 @@ define_class!(
         #[unsafe(method(rsShowActions:))]
         fn show_actions(&self, _sender: Option<&AnyObject>) {
             self.toggle_actions();
+        }
+
+        #[unsafe(method(rsAfterShow))]
+        fn rs_after_show(&self) {
+            self.after_show();
         }
 
         #[unsafe(method(rsCheckOnScreen))]
@@ -814,7 +821,6 @@ impl Controller {
     pub fn show(&self) {
         let s = self.ivars();
         let t = std::time::Instant::now();
-        *s.running.borrow_mut() = running_bundle_paths();
         if config::changed_since(s.config_modified.get()) {
             self.reload_config(false);
         }
@@ -826,20 +832,40 @@ impl Controller {
         self.present();
         self.order_front_here();
         s.panel.makeKeyWindow();
-        let focused = s.panel.makeFirstResponder(Some(&s.field));
-        // The shared field editor carries its own typing aids; turn them off too.
-        if let Some(editor) = s.field.currentEditor() {
-            if let Ok(editor) = editor.downcast::<NSTextView>() {
-                editor.setInlinePredictionType(NSTextInputTraitType::No);
-                editor.setMathExpressionCompletionType(NSTextInputTraitType::No);
-                editor.setAutomaticTextCompletionEnabled(false);
-                editor.setContinuousSpellCheckingEnabled(false);
+        // The field keeps the keyboard between summons; only a first summon,
+        // or one after another view took it, needs the (slow) hand-over.
+        let editor = s.field.currentEditor();
+        let has_focus = editor.as_ref().is_some_and(|e| {
+            s.panel.firstResponder().is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r).cast::<u8>(), Retained::as_ptr(e).cast::<u8>()))
+        });
+        let focused = has_focus || s.panel.makeFirstResponder(Some(&s.field));
+        if !has_focus {
+            // The shared field editor carries its own typing aids; turn them off too.
+            if let Some(editor) = s.field.currentEditor() {
+                if let Ok(editor) = editor.downcast::<NSTextView>() {
+                    editor.setInlinePredictionType(NSTextInputTraitType::No);
+                    editor.setMathExpressionCompletionType(NSTextInputTraitType::No);
+                    editor.setAutomaticTextCompletionEnabled(false);
+                    editor.setContinuousSpellCheckingEnabled(false);
+                }
             }
         }
         self.animate_in();
         let shown_ms = t.elapsed().as_secs_f64() * 1000.0;
-        // Refresh the catalog after the panel is up, so a scan never delays the
-        // summon. Re-present only if it changed and nothing has been typed yet.
+        event_log(&format!("shown in {shown_ms:.1} ms (key={} focus={focused})", s.panel.isKeyWindow()));
+        // Which apps are running, and the app folders, are refreshed only
+        // after this frame is on screen: together they took 20–25 ms, and the
+        // empty panel needs neither.
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(rsAfterShow), withObject: std::ptr::null::<AnyObject>(), afterDelay: 0.02f64]
+        };
+    }
+
+    /// The part of a summon that can wait until the panel is on screen.
+    fn after_show(&self) {
+        let s = self.ivars();
+        let t = std::time::Instant::now();
+        *s.running.borrow_mut() = running_bundle_paths();
         let fresh = self.scan_apps();
         let changed = {
             let items = s.items.borrow();
@@ -847,62 +873,62 @@ impl Controller {
         };
         if changed {
             *s.items.borrow_mut() = fresh;
-            if !s.query.borrow().is_empty() {
-                self.present();
-            }
         }
-        event_log(&format!(
-            "shown in {shown_ms:.1} ms (key={} focus={focused}, rescan {:.1} ms)",
-            s.panel.isKeyWindow(),
-            t.elapsed().as_secs_f64() * 1000.0 - shown_ms
-        ));
+        // Anything typed in the meantime was ranked without these; rank again.
+        if !s.query.borrow().is_empty() {
+            self.present();
+        }
+        if debug() {
+            eprintln!("[rs] after show: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
-    /// Show the panel on the Space in use. A long-running copy was seen
-    /// opening only on the desktop, not over a full-screen app, after the
-    /// screen had been locked; a fresh copy never did, and the cause is not
-    /// known. So the level and Spaces setting are applied again on every
-    /// summon, and a moment later `rsCheckOnScreen` asks the window server
-    /// whether the panel really is on screen, and moves it here if not.
+    /// Show the panel on the Space in use.
+    ///
+    /// A hidden panel belongs to no Space, and when shown the window server
+    /// puts it in every Space ("all Spaces" + full-screen auxiliary). A
+    /// long-running panel was found listed in the desktop Space only, and
+    /// from then on it was shown only there: over a full-screen app it was
+    /// ordered in but off screen. AppKit cannot see or undo that, so the
+    /// window server is asked directly (see spaces.rs) and the Space in use
+    /// is added when it is missing, before showing and again after.
     fn order_front_here(&self) {
         let panel = &self.ivars().panel;
+        let window = panel.windowNumber();
+        // Healthy, the panel is listed in no Space (never shown) or in all of
+        // them. Listed in some but not the one in use, it would open off
+        // screen: add the Space in use first.
+        if let (Some(listed), Some(active)) = (crate::spaces::of_window(window), crate::spaces::active()) {
+            if !listed.is_empty() && !listed.contains(&active) {
+                crate::spaces::add(window, active);
+                event_log(&format!("panel was held in Space {listed:?} only; added the Space in use ({active})"));
+            }
+        }
         panel.setLevel(panel.level());
         panel.setCollectionBehavior(panel.collectionBehavior());
         panel.orderFrontRegardless();
-        REPAIRED.set(false);
-        // `isOnActiveSpace` lags behind an order-front, so check on a later turn.
+        // The window server applies the order a moment later, so whether the
+        // panel landed in the Space in use is checked on a later turn.
         let _: () = unsafe {
             msg_send![self, performSelector: sel!(rsCheckOnScreen), withObject: std::ptr::null::<AnyObject>(), afterDelay: 0.15f64]
         };
     }
 
+    /// 0.15 s after showing: if the panel is open but still not on screen,
+    /// add it to the Space in use.
     fn check_on_screen(&self) {
         let panel = &self.ivars().panel;
-        if !panel.isVisible() || on_screen(panel.windowNumber()) {
-            if REPAIRED.replace(false) {
-                event_log("panel was not on the Space in use; moved it there");
-            }
+        let window = panel.windowNumber();
+        if !panel.isVisible() || on_screen(window) {
             return;
         }
-        if REPAIRED.get() {
-            REPAIRED.set(false);
-            event_log("panel is not on the Space in use, and moving it failed");
-            return;
-        }
-        let behavior = panel.collectionBehavior();
-        panel.orderOut(None);
-        panel.setCollectionBehavior(
-            NSWindowCollectionBehavior::MoveToActiveSpace
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::IgnoresCycle,
-        );
-        panel.orderFrontRegardless();
-        panel.makeKeyWindow();
-        panel.setCollectionBehavior(behavior);
-        REPAIRED.set(true);
-        let _: () = unsafe {
-            msg_send![self, performSelector: sel!(rsCheckOnScreen), withObject: std::ptr::null::<AnyObject>(), afterDelay: 0.15f64]
-        };
+        let spaces = crate::spaces::of_window(window).unwrap_or_default();
+        let Some(active) = crate::spaces::active() else { return };
+        crate::spaces::add(window, active);
+        event_log(&format!(
+            "panel was open but not on screen (in Space {spaces:?}, Space in use {active}); added it there: {}",
+            if crate::spaces::of_window(window).unwrap_or_default().contains(&active) { "done" } else { "failed" }
+        ));
     }
 
     /// Spotlight's opening animation, measured from a 60 fps recording over a
@@ -983,6 +1009,7 @@ impl Controller {
         if panel.isVisible() {
             event_log("hidden: dismissed");
             panel.orderOut(None);
+
         }
         if let Some(tint) = &self.ivars().tint {
             tint.stop();
