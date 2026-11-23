@@ -23,6 +23,10 @@ pub struct Config {
     pub theme_strength: String,
     /// The opening and resizing springs. Off: the panel appears at its size.
     pub animations: bool,
+    /// Shortcut that opens clipboard history. Empty until one is recorded.
+    pub clipboard_hotkey: String,
+    /// File and folder names appear under apps as you type.
+    pub search_files: bool,
     /// `alias = "App name"`: typing the alias ranks that app first.
     pub aliases: BTreeMap<String, String>,
     /// `keyword = "https://…{query}…"`: typing `keyword words` opens the URL.
@@ -56,7 +60,19 @@ impl Default for Ask {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { hotkey: "option+space".into(), default_currency: "INR".into(), menu_bar_icon: true, theme: "selection".into(), theme_strength: "mild".into(), animations: true, aliases: BTreeMap::new(), links: BTreeMap::new(), ask: Ask::default() }
+        Self {
+            hotkey: "option+space".into(),
+            default_currency: "INR".into(),
+            menu_bar_icon: true,
+            theme: "selection".into(),
+            theme_strength: "mild".into(),
+            animations: true,
+            clipboard_hotkey: String::new(),
+            search_files: true,
+            aliases: BTreeMap::new(),
+            links: BTreeMap::new(),
+            ask: Ask::default(),
+        }
     }
 }
 
@@ -70,6 +86,15 @@ const TEMPLATE: &str = r##"# rusty-spotlight configuration. Saved changes apply 
 # first turn off Spotlight's own shortcut in System Settings > Keyboard >
 # Keyboard Shortcuts > Spotlight.
 hotkey = "option+space"
+
+# Opens clipboard history. Empty disables it. "shift+cmd+space" is the usual
+# choice; first untick "Ask Siri about active window" in System Settings >
+# Keyboard > Keyboard Shortcuts > Screenshots, or macOS opens Siri instead.
+clipboard_hotkey = ""
+
+# File and folder names from Spotlight, listed under apps. "file notes" searches
+# only files and folders; "folder notes" searches folders.
+search_files = true
 
 # Used when a conversion names only one currency, e.g. "100 usd".
 default_currency = "INR"
